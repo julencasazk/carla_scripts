@@ -9,10 +9,6 @@ import cv2
 import multiprocessing
 
 
-
-
-
-
 def show_camera_feed(img_queue, lock):
     
     time.sleep(10)
@@ -20,7 +16,6 @@ def show_camera_feed(img_queue, lock):
     try:
         while True:
             payload = None
-            # Acquire lock briefly to read from the queue without blocking other process
             try:
                 with lock:
                     payload = img_queue.get_nowait()
@@ -31,20 +26,21 @@ def show_camera_feed(img_queue, lock):
 
             if payload is None:
                 break
-            # payload is (raw_bytes, width, height)
+            
             raw_bytes, width, height = payload
             array = np.frombuffer(raw_bytes, dtype=np.uint8)
             array = np.reshape(array, (height, width, 4))
-            array = array[:, :, :3]  # Drop alpha channel
+            array = array[:, :, :3]  # Without alpha channel
             cv2.imshow("Camera", array)
             if cv2.waitKey(1) & 0xFF == ord('q'):
                 break
     finally:
         cv2.destroyAllWindows()
+        sys.exit(0)
+
 
 def main(img_queue, lock):
     
-
     parser = argparse.ArgumentParser(description="Print vehicle data from CARLA")
     parser.add_argument('--host', type=str, default='localhost', help='CARLA host')
     parser.add_argument('--port', type=int, default=2000, help='CARLA port')
@@ -55,10 +51,15 @@ def main(img_queue, lock):
     world = client.get_world()
     blueprint_library = world.get_blueprint_library()
     
-    vehicle_bp = np.random.choice(blueprint_library.filter('vehicle'))
+    # spawn a model 3 vehicle
+    vehicle_bp = blueprint_library.find('vehicle.tesla.model3')
     vehicle = world.spawn_actor(vehicle_bp, np.random.choice(world.get_map().get_spawn_points()))
     vehicle.set_autopilot(True)
     print(f"Spawned {vehicle.type_id}")
+    
+    physics_control = vehicle.get_physics_control()
+    max_steer_angle = physics_control.wheels[0].max_steer_angle
+    print(f"Max Steering Angle: {max_steer_angle}")
     
     # calculate vehicle length and width
     vehicle_length = vehicle.bounding_box.extent.x * 2
@@ -77,10 +78,12 @@ def main(img_queue, lock):
     camera_bp = blueprint_library.find('sensor.camera.rgb')
     camera_bp.set_attribute('image_size_x', '640')
     camera_bp.set_attribute('image_size_y', '480')
-    camera_transform = carla.Transform(carla.Location(x=0.8, z=1.7))
+    camera_transform = carla.Transform(carla.Location(x=0.8, y=1.2, z=1.0), carla.Rotation(yaw=15))
     camera = world.spawn_actor(camera_bp, camera_transform, attach_to=vehicle)
     print(f"Spawned {camera.type_id}")
+    
 
+    # spawn GPS
     gps_sensor = None
     if not gps_sensor:
         gps_bp = blueprint_library.find('sensor.other.gnss')
@@ -88,7 +91,7 @@ def main(img_queue, lock):
         gps_sensor = world.spawn_actor(gps_bp, gps_transform, attach_to=vehicle)
         print(f"Spawned {gps_sensor.type_id}")
         time.sleep(1)  # Give sensor time to initialize
-    
+    # spawn IMU  
     imu_sensor = None
     if not imu_sensor:
         imu_bp = blueprint_library.find('sensor.other.imu')
@@ -100,12 +103,10 @@ def main(img_queue, lock):
     gps_queue = queue.Queue()
     gps_sensor.listen(gps_queue.put)
     
-    # Use the multiprocessing queue provided to this process and send picklable data
-    # Convert raw_data to bytes so it can be sent between processes
     def camera_callback(image):
-        # Acquire lock only for the brief put operation to avoid race conditions
         with lock:
             img_queue.put((bytes(image.raw_data), image.width, image.height))
+
     camera.listen(camera_callback)
 
     imu_queue = queue.Queue()
@@ -120,9 +121,6 @@ def main(img_queue, lock):
     
     try:
         while True:
-            
-            gps_data = None
-            imu_data = None
 
             try:             
                 gps_data = gps_queue.get(timeout=1.0)
@@ -133,15 +131,39 @@ def main(img_queue, lock):
             except Exception as e:
                 print(f"Error occurred while getting vehicle data: {e}")
                 continue
+            
+            gps_queue.queue.clear()
+            imu_queue.queue.clear()
 
             transform = vehicle.get_transform()
             velocity = vehicle.get_velocity()
             angular_velocity = vehicle.get_angular_velocity()
+            yaw_rate = angular_velocity.y * 180 / np.pi  # Convert to degrees per second
             acceleration = vehicle.get_acceleration()
+            
+            '''
+            Steering angle depends on the wheelspan and the steering input.
+            Vehicle steering input is a float in range [-1.0, 1.0] and max_steer_angle
+            is the maximum steering angle of the front wheels in degrees.
+            max_steer_angle is obtained from the vehicle's physics control.
+            '''
+            steering_angle = vehicle.get_control().steer * max_steer_angle
             yaw = transform.rotation.yaw
+            # Curvature calculation 
+            wheelbase = 2.875  # in m for Tesla Model 3
+            '''
+            I took this formula from the internet, I still don't
+            understand it completely.
+            '''
+            turn_radius = wheelbase / np.sin(np.radians(steering_angle)) if steering_angle != 0 else float('inf')
+            curvature = 1 / turn_radius if turn_radius != float('inf') else 0
+            # Is the vehicle in reverse?
             drive_direction = vehicle.get_control().reverse
             
-            # Print data in-place (overwrite previous lines)
+            # Print all data
+            print("-" * 40)
+            
+            print(f"Vehicle Type: {vehicle.type_id}            ")
             print(f"  Yaw: {yaw}            ")
             print(f"  Location: {transform.location}            ")
             print(f"  Rotation: {transform.rotation}            ")
@@ -157,22 +179,56 @@ def main(img_queue, lock):
             print(f"  Drive Direction (Reverse): {drive_direction}            ")
             print(f"  Vehicle Length: {vehicle_length}            ")
             print(f"  Vehicle Width: {vehicle_width}            ")
-            print("\033[F" * 8, end="")  # Move cursor up 8 lines to overwrite previous output
-            time.sleep(0.1)
+            print(f"  Steering Angle: {steering_angle}            ")
+            print(f"  Angular velocity (Yaw Rate): {yaw_rate}            ")
+            print(f"  Relation between steering angle and yaw rate: {steering_angle / yaw_rate if yaw_rate != 0 else 0}            ")
+            print(f"  Wheelbase: {wheelbase}            ")
+            print(f"  Turn Radius: {turn_radius}            ")
+            print(f"  Curvature: {curvature}            ")
+            
+            print("-" * 40)
+            print("\033[F" * 16, end="")  # Move cursor up 16 lines to overwrite previous output
+
     finally:
+        # Exit cleanly
+        if gps_sensor is not None:
+            gps_sensor.stop()
+            gps_sensor.destroy()
+        if imu_sensor is not None:
+            imu_sensor.stop()
+            imu_sensor.destroy()
+        if camera is not None:
+            camera.stop()
+            camera.destroy()
+        if vehicle is not None:
+            vehicle.destroy()
+        
         clean_exit(None, None)
 
 
 if __name__ == "__main__":
-    # Create a multiprocessing.Queue and a Lock and pass them to both processes
+    
     img_queue = multiprocessing.Queue()
     lock = multiprocessing.Lock()
-    p1 = multiprocessing.Process(target=show_camera_feed, args=(img_queue, lock))
-    p2 = multiprocessing.Process(target=main, args=(img_queue, lock))
-    p1.start()
-    p2.start()
-    p2.join()
-    # When main exits, signal the show process to stop
-    with lock:
-        img_queue.put(None)
-    p1.join()
+    processes = [
+        multiprocessing.Process(target=show_camera_feed, args=(img_queue, lock)),
+        multiprocessing.Process(target=main, args=(img_queue, lock))
+    ]
+
+    def terminate_all(signum, frame):
+        print("Terminating all processes...")
+        for p in processes:
+            if p.is_alive():
+                p.terminate()
+        with lock:
+            img_queue.put(None)
+        for p in processes:
+            p.join()
+        sys.exit(0)
+
+    signal.signal(signal.SIGINT, terminate_all)
+
+    for p in processes:
+        p.start()
+    for p in processes:
+        p.join()
