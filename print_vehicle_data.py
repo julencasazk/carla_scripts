@@ -9,12 +9,17 @@ import cv2
 import multiprocessing
 
 
-def show_camera_feed(img_queue, lock):
+def show_camera_feed(img_queue, lock, flag):
     
     time.sleep(10)
     cv2.namedWindow("Camera", cv2.WINDOW_NORMAL)
     try:
+
         while True:
+
+            if flag.is_set():
+                break
+            
             payload = None
             try:
                 with lock:
@@ -35,11 +40,12 @@ def show_camera_feed(img_queue, lock):
             if cv2.waitKey(1) & 0xFF == ord('q'):
                 break
     finally:
+        print("Cleaning up OpenCV process...")
         cv2.destroyAllWindows()
-        sys.exit(0)
+        print("Destroyed all windows...")
 
 
-def main(img_queue, lock):
+def main(img_queue, lock, flag):
     
     parser = argparse.ArgumentParser(description="Print vehicle data from CARLA")
     parser.add_argument('--host', type=str, default='localhost', help='CARLA host')
@@ -65,14 +71,6 @@ def main(img_queue, lock):
     vehicle_length = vehicle.bounding_box.extent.x * 2
     vehicle_width = vehicle.bounding_box.extent.y * 2
     
-        
-    def clean_exit(signum, frame):
-        print("Exiting...")
-        print("\n" * 10)  # Move cursor down to avoid overwriting
-        if vehicle is not None:
-            vehicle.destroy()
-        sys.exit(0)
-
 
     # spawn camera
     camera_bp = blueprint_library.find('sensor.camera.rgb')
@@ -115,14 +113,17 @@ def main(img_queue, lock):
     print("Waiting for a bit...")
     time.sleep(5)  # wait for a while to let sensors start
 
-    signal.signal(signal.SIGINT, clean_exit)
+
     
     print("Starting to print vehicle data...")
-    
+
     try:
         while True:
 
-            try:             
+            if flag.is_set():
+                break
+
+            try:
                 gps_data = gps_queue.get(timeout=1.0)
                 imu_data = imu_queue.get(timeout=1.0)
             except queue.Empty:
@@ -187,9 +188,10 @@ def main(img_queue, lock):
             print(f"  Curvature: {curvature}            ")
             
             print("-" * 40)
-            print("\033[F" * 16, end="")  # Move cursor up 16 lines to overwrite previous output
+            print("\033[F" * 22, end="")  # Move cursor up 22 lines to overwrite previous output
 
     finally:
+        print("Cleaning up CARLA process...")
         # Exit cleanly
         if gps_sensor is not None:
             gps_sensor.stop()
@@ -202,29 +204,24 @@ def main(img_queue, lock):
             camera.destroy()
         if vehicle is not None:
             vehicle.destroy()
+        sys.exit(0)
         
-        clean_exit(None, None)
 
 
 if __name__ == "__main__":
     
     img_queue = multiprocessing.Queue()
     lock = multiprocessing.Lock()
+
+    flag = multiprocessing.Event()
     processes = [
-        multiprocessing.Process(target=show_camera_feed, args=(img_queue, lock)),
-        multiprocessing.Process(target=main, args=(img_queue, lock))
+        multiprocessing.Process(target=show_camera_feed, args=(img_queue, lock, flag)),
+        multiprocessing.Process(target=main, args=(img_queue, lock, flag))
     ]
 
     def terminate_all(signum, frame):
         print("Terminating all processes...")
-        for p in processes:
-            if p.is_alive():
-                p.terminate()
-        with lock:
-            img_queue.put(None)
-        for p in processes:
-            p.join()
-        sys.exit(0)
+        flag.set()
 
     signal.signal(signal.SIGINT, terminate_all)
 
