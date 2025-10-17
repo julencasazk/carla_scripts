@@ -74,7 +74,7 @@ dependencies:
       - nbformat==5.10.4
       - nest-asyncio==1.6.0
       - networkx==3.4.2
-      - numpy==2.2.6
+      - numpy
       - open3d==0.19.0
       - opencv-python==4.12.0.88
       - packaging==25.0
