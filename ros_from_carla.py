@@ -51,6 +51,8 @@ class CarlaRosNode(Node):
         self._speed_pub = self.create_publisher(Float32, 'speed', 10)
         self._throttle_sub = self.create_subscription(Float32, 'throttle_cmd', self.throttle_cb, 10)
         self._steer_sub = self.create_subscription(Float32, 'steer_cmd', self.steer_cb, 10)
+        self._steer_sub = self.create_subscription(Bool, 'reverse_cmd', self.reverse_cb, 10)
+        self._brake_sub = self.create_subscription(Float32, 'brake_cmd', self.throttle_cb, 10)
         self._pub_timer = self.create_timer(0.1, self.publish)
         
     def publish(self):
@@ -70,6 +72,15 @@ class CarlaRosNode(Node):
         control.steer = msg.data
         self._vehicle.apply_control(control)
         
+    def reverse_cb(self, msg: Bool):
+        control = self._vehicle.get_control()
+        control.reverse = msg.data
+        self._vehicle.apply_control(control)
+        
+    def brake_cb(self, msg: Float32):
+        control = self._vehicle.get_control()
+        control.brake = msg.data
+        self._vehicle.apply_control(control)
         
     
 def ros_background_spin(vehicle):

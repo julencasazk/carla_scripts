@@ -16,11 +16,13 @@ class VehicleControlNode(Node):
         super().__init__('vehicle_ctrl')
         self._keypress_buff = keypress_buff
         self._throttle_pub = self.create_publisher(Float32, 'throttle_cmd', 10)
+        self._brake_pub = self.create_publisher(Float32, 'brake_cmd', 10)
         self._steer_pub = self.create_publisher(Float32, 'steer_cmd', 10)
         self._reverse_pub = self.create_publisher(Bool, 'reverse_cmd', 10)
         self._timer = self.create_timer(0.01, self.timer_cb)
         self._return_timer = self.create_timer(0.1, self.return_timer_cb)
         self._throttle = Float32()
+        self._brake = Float32()
         self._steer = Float32()
         self._reverse = Bool()
         self._return_strength = 0.1
@@ -30,6 +32,10 @@ class VehicleControlNode(Node):
         self._throttle.data -= self._return_strength
         if (self._throttle.data < 0.0):
             self._throttle.data = 0.0
+        
+        self._brake.data -= self._return_strength
+        if (self._brake.data < 0.0):
+            self._brake.data = 0.0 
             
         if (self._steer.data > 0):
             if (self._steer.data > self._return_strength):
@@ -51,17 +57,30 @@ class VehicleControlNode(Node):
                 if (self._reverse.data == True and self._throttle.data == 0):
                     self._reverse.data = False
                 else:
-                    self._throttle.data += self._cmd_strength
+                    if (not self._reverse.data):
+                        self._throttle.data += self._cmd_strength
+                    else:
+                        self._brake.data += self._cmd_strength
+
                     if (self._throttle.data > 1.0):
                         self._throttle.data = 1.0
+                    if (self._brake.data > 1.0):
+                        self._brake.data = 1.0
+                    
                 
             elif ord(c) == ord("s"):
                 if (self._reverse.data == False and self._throttle.data == 0):
                     self._reverse.data = True
                 else:
-                    self._throttle.data += self._cmd_strength
+                    if (self._reverse.data):
+                        self._throttle.data += self._cmd_strength
+                    else:
+                        self._brake.data += self._cmd_strength
+                        
                     if (self._throttle.data > 1.0):
                         self._throttle.data = 1.0
+                    if (self._brake.data > 1.0):
+                        self._brake.data = 1.0
 
             elif ord(c) == ord("a"):
                 self._steer.data -= self._cmd_strength
@@ -71,7 +90,7 @@ class VehicleControlNode(Node):
             elif ord(c) == ord("d"):
                 self._steer.data += self._cmd_strength
                 if (self._steer.data > 1.0):
-                    self._steer.data = 1.0               
+                    self._steer.data = 1.0         
 
                 
         except IndexError:
@@ -96,7 +115,10 @@ def main():
     while True:
         if kb.kbhit():
             c = kb.getch()
-            chars.append(c)   
+            # Keep a circular buffer of max 5 chars (drop oldest)
+            if len(chars) >= 5:
+                del chars[0]
+            chars.append(c)
             if ord(c) == 27:
                 executor.shutdown(timeout_sec=1.0)
                 node.destroy_node()
