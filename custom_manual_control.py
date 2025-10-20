@@ -15,10 +15,11 @@ class VehicleControlNode(Node):
     def __init__(self, keypress_buff):
         super().__init__('vehicle_ctrl')
         self._keypress_buff = keypress_buff
-        self._throttle_pub = self.create_publisher(Float32, 'throttle_cmd', 10)
-        self._brake_pub = self.create_publisher(Float32, 'brake_cmd', 10)
-        self._steer_pub = self.create_publisher(Float32, 'steer_cmd', 10)
-        self._reverse_pub = self.create_publisher(Bool, 'reverse_cmd', 10)
+        qos = rclpy.qos.QoSProfile(depth=10, reliability=rclpy.qos.QoSReliabilityPolicy.BEST_EFFORT)
+        self._throttle_pub = self.create_publisher(Float32, 'throttle_debug', qos)
+        self._brake_pub = self.create_publisher(Float32, 'brake_debug', qos)
+        self._steer_pub = self.create_publisher(Float32, 'steer_debug', qos)
+        self._reverse_pub = self.create_publisher(Bool, 'reverse_debug', qos)
         self._timer = self.create_timer(0.01, self.timer_cb)
         self._return_timer = self.create_timer(0.1, self.return_timer_cb)
         self._throttle = Float32()

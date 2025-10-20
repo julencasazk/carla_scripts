@@ -48,11 +48,12 @@ class CarlaRosNode(Node):
     def __init__(self, vehicle):
         super().__init__('carla_vehicle_control')
         self._vehicle = vehicle
-        self._speed_pub = self.create_publisher(Float32, 'speed', 10)
-        self._throttle_sub = self.create_subscription(Float32, 'throttle_cmd', self.throttle_cb, 10)
-        self._steer_sub = self.create_subscription(Float32, 'steer_cmd', self.steer_cb, 10)
-        self._steer_sub = self.create_subscription(Bool, 'reverse_cmd', self.reverse_cb, 10)
-        self._brake_sub = self.create_subscription(Float32, 'brake_cmd', self.throttle_cb, 10)
+        qos = rclpy.qos.QoSProfile(depth=10, reliability=rclpy.qos.QoSReliabilityPolicy.BEST_EFFORT)
+        self._speed_pub = self.create_publisher(Float32, 'speed', qos)
+        self._throttle_sub = self.create_subscription(Float32, 'throttle_cmd', self.throttle_cb, qos)
+        self._steer_sub = self.create_subscription(Float32, 'steer_cmd', self.steer_cb, qos)
+        self._steer_sub = self.create_subscription(Bool, 'reverse_cmd', self.reverse_cb, qos)
+        self._brake_sub = self.create_subscription(Float32, 'brake_cmd', self.throttle_cb, qos)
         self._pub_timer = self.create_timer(0.1, self.publish)
         
     def publish(self):
