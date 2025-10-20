@@ -1,119 +1,119 @@
 import carla
 import numpy as np
-import argparse
 import open3d as o3d
 import time
+import threading
+from collections import deque
 
-def main():
-    parser = argparse.ArgumentParser(description="Testing LiDAR sensors in CARLA sim with ROS and micro-ROS with a ESP32\nFirst execute another script that spawns a vehicle")
-    parser.add_argument('--host', type=str, default='localhost', help="CARLA host IP")
-    parser.add_argument('--port', type=int, default=2000, help="CARLA port")
-    parser.add_argument('--vehicle', type=str, default='vehicle.tesla.model3', help="Vehicle model from CARLA blueprint library")
-    parser.add_argument('--no-vis', action='store_true', help='Disable Open3D visualization (headless mode)')
-    args = parser.parse_args()
+CARLA_HOST = '172.16.124.210'
+CARLA_PORT = 2000
+N_FRAMES = 20 
 
-    # Visualization (optional / headless fallback)
-    use_vis = not args.no_vis
-    pcd_o3d, vis = None, None
-    if use_vis:
-        try:
-            pcd_o3d = o3d.geometry.PointCloud()
-            vis = o3d.visualization.Visualizer()
-            vis.create_window(window_name="LiDAR Point Cloud")
-            vis.add_geometry(pcd_o3d)
-            vc = vis.get_view_control()
-            if vc is not None:
-                vc.set_constant_z_far(1000)
-            else:
-                print("Open3D view control unavailable; disabling visualization.")
-                use_vis = False
-        except Exception as e:
-            print("Open3D visualization unavailable; running headless. Reason:", e)
-            use_vis, pcd_o3d, vis = False, None, None
+client = carla.Client(CARLA_HOST, CARLA_PORT)
+client.set_timeout(10.0)
+world = client.get_world()
+bp_lib = world.get_blueprint_library()
 
-    # CARLA client
-    client = carla.Client(args.host, args.port)
-    client.set_timeout(10.0)
-    world = client.get_world()
-    bp_library = world.get_blueprint_library()
+vehicles = world.get_actors().filter('vehicle.*model3*')
+if len(vehicles) == 0:
+    vehicles = world.get_actors().filter('vehicle.*')
+vehicle = vehicles[0]
+print(f"Using vehicle: {vehicle.type_id}")
 
-    # Vehicle selection
-    vehicle = None
-    try:
-        matches = world.get_actors().filter(args.vehicle)
-        if len(matches) > 0:
-            vehicle = matches[0]
-        else:
-            any_vehicle = world.get_actors().filter('vehicle.*')
-            if len(any_vehicle) > 0:
-                vehicle = any_vehicle[0]
-    except Exception:
-        pass
-    if vehicle is None:
-        raise RuntimeError(f"No actor found with blueprint {args.vehicle}")
+vehicle.set_autopilot(True)
 
-    # Autopilot
-    try:
-        vehicle.set_autopilot(True)
-    except Exception:
-        pass
+# Values similar to Velodyne VLP-16 "Puck"
+lidar_bp = bp_lib.find('sensor.lidar.ray_cast')
+lidar_bp.set_attribute('range', '100')
+lidar_bp.set_attribute('rotation_frequency', '10')
+lidar_bp.set_attribute('points_per_second', '300000')
+lidar_bp.set_attribute('channels', '16')
+lidar_bp.set_attribute('upper_fov', '15')
+lidar_bp.set_attribute('lower_fov', '-15')
 
-    # LiDAR setup
-    lidar_bp = bp_library.find('sensor.lidar.ray_cast')
-    lidar_bp.set_attribute('range', '100')
-    lidar_bp.set_attribute('points_per_second', '56000')
-    sensor = None
-    try:
-        sensor = world.spawn_actor(
-            lidar_bp,
-            carla.Transform(carla.Location(x=0.0, y=0.0, z=1.0)),
-            attach_to=vehicle
-        )
-    except Exception as e:
-        raise RuntimeError(f"Failed to spawn LiDAR: {e}")
+lidar_transform = carla.Transform(carla.Location(x=0, z=2.5))
+lidar = world.spawn_actor(lidar_bp, lidar_transform, attach_to=vehicle)
+print("LiDAR sensor attached.")
 
-    # Callback
-    def lidar_cb(point_cloud):
-        try:
-            data = np.frombuffer(point_cloud.raw_data, dtype=np.float32)
-            if data.size == 0:
-                print("Received empty point cloud")
-                return
-            points = data.reshape((-1, 4))[:, :3]
-            if use_vis and pcd_o3d is not None and vis is not None:
-                pcd_o3d.points = o3d.utility.Vector3dVector(points)
-                vis.update_geometry(pcd_o3d)
-            print(f"Received {points.shape[0]} points from LiDAR")
-        except Exception as e:
-            print("LiDAR callback error:", e)
+lock = threading.Lock()
+recent_frames = deque(maxlen=N_FRAMES)
 
-    sensor.listen(lidar_cb)
+def lidar_callback(point_cloud):
+    global recent_frames
+    pts = np.frombuffer(point_cloud.raw_data, dtype=np.float32)
+    pts = np.reshape(pts, (int(pts.shape[0] / 4), 4))[:, :3]
+                
+    data_size = pts.nbytes
+    size_kb = data_size / 1024
+    print(f"Size of data: {size_kb} KB")
 
-    # Main loop
-    try:
-        while True:
-            if use_vis and vis is not None:
-                vis.poll_events()
-                vis.update_renderer()
-            time.sleep(0.05)
-    except KeyboardInterrupt:
-        pass
-    finally:
-        try:
-            if sensor is not None:
-                sensor.stop()
-        except Exception:
-            pass
-        try:
-            if sensor is not None:
-                sensor.destroy()
-        except Exception:
-            pass
-        if use_vis and vis is not None:
-            try:
-                vis.destroy_window()
-            except Exception:
-                pass
+    lidar_world_matrix = np.array(lidar.get_transform().get_matrix())
+    pts_h = np.hstack((pts, np.ones((pts.shape[0], 1))))
+    pts_world = (lidar_world_matrix @ pts_h.T).T[:, :3]
+    with lock:
+        recent_frames.append(pts_world)
 
-if __name__ == "__main__":
-    main()
+lidar.listen(lidar_callback)
+
+vis = o3d.visualization.Visualizer()
+vis.create_window("LiDAR Rolling View", width=960, height=720)
+pcd = o3d.geometry.PointCloud()
+vis.add_geometry(pcd)
+
+opt = vis.get_render_option()
+opt.background_color = np.asarray([0, 0, 0])
+opt.point_size = 2.0
+
+view_ctl = vis.get_view_control() # To center the vis on the car
+
+print("Streaming LiDAR data with rolling accumulation...")
+
+first_frame = True
+try:
+    while True:
+        with lock:
+            if len(recent_frames) == 0:
+                continue
+            # Concatenate last N frames
+            pts_combined = np.vstack(recent_frames)
+
+
+        car_tf = vehicle.get_transform()
+        car_loc = car_tf.location
+        car_rot = car_tf.rotation
+        car_pos = np.array([car_loc.x, car_loc.y, car_loc.z])
+        dists = np.linalg.norm(pts_combined - car_pos, axis=1)
+
+        # Color by height for clarity
+        d_min, d_max = np.min(dists), np.max(dists)
+        colors = (dists - d_min) / (d_max - d_min + 1e-6)
+        colors = np.stack([colors, 1 - colors, np.zeros_like(colors)], axis=1)
+        
+
+        pcd.points = o3d.utility.Vector3dVector(pts_combined)
+        pcd.colors = o3d.utility.Vector3dVector(colors)
+
+        vis.update_geometry(pcd)
+        vis.poll_events()
+        vis.update_renderer()
+        
+        
+        distance = 20.0
+        height = 10.0
+        
+        view_ctl.set_lookat(car_pos)
+        
+
+        if first_frame:
+            vis.reset_view_point(True)
+            first_frame = False
+
+        time.sleep(0.05)
+
+except KeyboardInterrupt:
+    print("\nInterrupted by user.")
+finally:
+    lidar.stop()
+    lidar.destroy()
+    vis.destroy_window()
+    print("LiDAR and viewer closed.")
