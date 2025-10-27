@@ -1,0 +1,12 @@
+<?xml version="1.0"?>
+<robot name="imu_only">
+  <link name="base_link"/>
+  <link name="imu_link"/>
+
+  <!-- Adjust xyz/rpy to the real mounting pose of the IMU on the robot -->
+  <joint name="imu_mount" type="fixed">
+    <parent link="base_link"/>
+    <child link="imu_link"/>
+    <origin xyz="0 0 0" rpy="0 0 0"/>
+  </joint>
+</robot>
