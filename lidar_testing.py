@@ -24,12 +24,12 @@ vehicle.set_autopilot(True)
 
 # Values similar to Velodyne VLP-16 "Puck"
 lidar_bp = bp_lib.find('sensor.lidar.ray_cast')
-lidar_bp.set_attribute('range', '100')
-lidar_bp.set_attribute('rotation_frequency', '10')
-lidar_bp.set_attribute('points_per_second', '300000')
+lidar_bp.set_attribute('range', '12')
+lidar_bp.set_attribute('rotation_frequency', '5')
+lidar_bp.set_attribute('points_per_second', '8000')
 lidar_bp.set_attribute('channels', '16')
-lidar_bp.set_attribute('upper_fov', '15')
-lidar_bp.set_attribute('lower_fov', '-15')
+lidar_bp.set_attribute('upper_fov', '1')
+lidar_bp.set_attribute('lower_fov', '-1')
 
 lidar_transform = carla.Transform(carla.Location(x=0, z=2.5))
 lidar = world.spawn_actor(lidar_bp, lidar_transform, attach_to=vehicle)
@@ -71,44 +71,48 @@ print("Streaming LiDAR data with rolling accumulation...")
 first_frame = True
 try:
     while True:
-        with lock:
-            if len(recent_frames) == 0:
-                continue
-            # Concatenate last N frames
-            pts_combined = np.vstack(recent_frames)
+        try:
+            with lock:
+                if len(recent_frames) == 0:
+                    continue
+                # Concatenate last N frames
+                pts_combined = np.vstack(recent_frames)
 
 
-        car_tf = vehicle.get_transform()
-        car_loc = car_tf.location
-        car_rot = car_tf.rotation
-        car_pos = np.array([car_loc.x, car_loc.y, car_loc.z])
-        dists = np.linalg.norm(pts_combined - car_pos, axis=1)
+            car_tf = vehicle.get_transform()
+            car_loc = car_tf.location
+            car_rot = car_tf.rotation
+            car_pos = np.array([car_loc.x, car_loc.y, car_loc.z])
+            dists = np.linalg.norm(pts_combined - car_pos, axis=1)
 
-        # Color by height for clarity
-        d_min, d_max = np.min(dists), np.max(dists)
-        colors = (dists - d_min) / (d_max - d_min + 1e-6)
-        colors = np.stack([colors, 1 - colors, np.zeros_like(colors)], axis=1)
-        
+            # Color by height for clarity
+            d_min, d_max = np.min(dists), np.max(dists)
+            colors = (dists - d_min) / (d_max - d_min + 1e-6)
+            colors = np.stack([colors, 1 - colors, np.zeros_like(colors)], axis=1)
+            
 
-        pcd.points = o3d.utility.Vector3dVector(pts_combined)
-        pcd.colors = o3d.utility.Vector3dVector(colors)
+            pcd.points = o3d.utility.Vector3dVector(pts_combined)
+            pcd.colors = o3d.utility.Vector3dVector(colors)
 
-        vis.update_geometry(pcd)
-        vis.poll_events()
-        vis.update_renderer()
-        
-        
-        distance = 20.0
-        height = 10.0
-        
-        view_ctl.set_lookat(car_pos)
-        
+            vis.update_geometry(pcd)
+            vis.poll_events()
+            vis.update_renderer()
+            
+            
+            distance = 20.0
+            height = 10.0
+            
+            view_ctl.set_lookat(car_pos)
+            
 
-        if first_frame:
-            vis.reset_view_point(True)
-            first_frame = False
+            if first_frame:
+                vis.reset_view_point(True)
+                first_frame = False
 
-        time.sleep(0.05)
+            time.sleep(0.05)
+        except: 
+            print("No points available for this frame")
+            pass
 
 except KeyboardInterrupt:
     print("\nInterrupted by user.")
