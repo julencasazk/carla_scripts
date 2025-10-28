@@ -17,6 +17,8 @@ import threading
 import math
 
 
+
+
 # Axis Map for quickly changing axis from real IMU to CARLA.
 # e.g. rolling the imu left pitches carla up: 'PITCH_FROM': ('roll', -1)
 AXIS_MAP = {
@@ -81,14 +83,18 @@ def quat_to_euler_deg(x, y, z, w):
     return math.degrees(roll), math.degrees(pitch), math.degrees(yaw)
 
 class CarlaRosNode(Node):
-    def __init__(self, camera, base_transform):
+    def __init__(self, camera, base_transform, abs_rot_enable):
         super().__init__('carla_cam_control')
         qos = rclpy.qos.QoSProfile(depth=10, reliability=rclpy.qos.QoSReliabilityPolicy.BEST_EFFORT)
         self._imu_sub = self.create_subscription(Imu, 'imu_data', self.imu_cb, qos)
         self._camera = camera
         self._base_loc = base_transform.location
         self._base_rot = base_transform.rotation
-        self._rotation_mult = 3
+        self._last_r_m = None 
+        self._last_p_m = None 
+        self._last_y_m = None
+        self._abs_rot_enable = abs_rot_enable
+        self._first_reading_done = False
         
     # Replace axis between them following the map
     def _apply_axis_map(self, roll, pitch, yaw):
@@ -107,10 +113,21 @@ class CarlaRosNode(Node):
         r, p, y = quat_to_euler_deg(ox, oy, oz, ow)
         
         r_m, p_m, y_m = self._apply_axis_map(r, p, y)
+        
+        if (not self._first_reading_done):
+            self._last_p_m = p_m
+            self._last_r_m = r_m
+            self._last_y_m = y_m
+            self._first_reading_done = True
 
-        roll_carla  = self._base_rot.roll  + (r_m * self._rotation_mult)
-        pitch_carla = self._base_rot.pitch + (p_m * self._rotation_mult)
-        yaw_carla   = self._base_rot.yaw   + (y_m * self._rotation_mult)
+        if not self._abs_rot_enable:
+            r_m = r_m - self._last_r_m
+            p_m = p_m - self._last_p_m 
+            y_m = y_m - self._last_y_m
+
+        roll_carla  = self._base_rot.roll  + r_m
+        pitch_carla = self._base_rot.pitch + p_m
+        yaw_carla   = self._base_rot.yaw   + y_m
 
         new_rot = carla.Rotation(pitch=pitch_carla, yaw=yaw_carla, roll=roll_carla)
         self._camera.set_transform(carla.Transform(self._base_loc, new_rot))
@@ -118,9 +135,9 @@ class CarlaRosNode(Node):
     
         
     
-def ros_background_spin(camera, base_transform):
+def ros_background_spin(camera, base_transform, abs_rot_enable):
     rclpy.init()
-    node = CarlaRosNode(camera, base_transform)
+    node = CarlaRosNode(camera, base_transform, abs_rot_enable)
     executor = rclpy.executors.SingleThreadedExecutor()
     executor.add_node(node)
     t = threading.Thread(target=executor.spin, daemon=True)
@@ -133,7 +150,11 @@ def main(img_queue, img_lock):
     parser = argparse.ArgumentParser(description="Publish vehicle data and control the vehicle with ROS")
     parser.add_argument('--port', type=int, default=2000, help="CARLA port")
     parser.add_argument('--host', type=str, default='localhost', help="CARLA port")
+    parser.add_argument('--abs', action='store_true', help="Use absolute rotation from IMU")
     args = parser.parse_args()
+    
+    print("CARLA Camera controller with IMU")
+    print("Mash Ctrl+C to exit, idk")
     
     # CARLA Client setup
     client = carla.Client(args.host, args.port)
@@ -168,7 +189,7 @@ def main(img_queue, img_lock):
     
     cam.listen(cam_callback)
     
-    executor, node, ros_t = ros_background_spin(cam, cam_transform)
+    executor, node, ros_t = ros_background_spin(cam, cam_transform, args.abs)
         
     print(f"Waiting for sensors to start...")
     time.sleep(5)
