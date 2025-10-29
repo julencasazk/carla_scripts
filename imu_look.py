@@ -145,10 +145,17 @@ def dash_cam(args, img_queue, img_lock, imu_data_queue):
                 img_item = dpg.add_image(tex_tag, width=cur_w, height=cur_h)
 
             # IMU text window
+            max_angular = [0,0,0]
+            max_linear = [0,0,0]
+            max_orientation = [0,0,0,0]
             with dpg.window(label="IMU_Data", tag="data_window", pos=(cur_w + 8, 0), width=340, height=200):
                 text_angular_vel = dpg.add_text("Angular Velocity: (0, 0, 0) [x, y, z]")
+                text_max_angular_vel = dpg.add_text("MAX Angular: (0, 0, 0) [x, y, z]")
                 text_linear_acc = dpg.add_text("Linear Acceleration: (0, 0, 0) [x, y, z]")
+                text_max_linear_acc = dpg.add_text("MAX Linear: (0, 0, 0) [x, y, z]")
                 text_orientation = dpg.add_text("Orientation: (0, 0, 0, 0) [x, y, z, w]")
+                text_max_orientation = dpg.add_text("MAX Orientation: (0, 0, 0, 0) [x, y, z, w]")
+                reset_button = dpg.add_button(label="Reset MAX values", width=150)
 
             # Orientation wireframe window + drawlist
             with dpg.window(label="IMU Orientation", tag="orient_window", pos=(cur_w + 8, 210), width=340, height=360):
@@ -196,6 +203,41 @@ def dash_cam(args, img_queue, img_lock, imu_data_queue):
                 if data_payload:
                     imu_msg, roll_carla, pitch_carla, yaw_carla = data_payload
                     last_rpy = (roll_carla, pitch_carla, yaw_carla)
+                    
+                    if abs(imu_msg.angular_velocity.x) > max_angular[0]:
+                        max_angular[0] = abs(imu_msg.angular_velocity.x)
+                    if abs(imu_msg.angular_velocity.y) > max_angular[1]:
+                        max_angular[1] = abs(imu_msg.angular_velocity.y)
+                    if abs(imu_msg.angular_velocity.z) > max_angular[2]:
+                        max_angular[2] = abs(imu_msg.angular_velocity.z)
+                    
+                    if abs(imu_msg.linear_acceleration.x) > max_linear[0]:
+                        max_linear[0] = abs(imu_msg.linear_acceleration.x)
+                    if abs(imu_msg.linear_acceleration.y) > max_linear[1]:
+                        max_linear[1] = abs(imu_msg.linear_acceleration.y)
+                    if abs(imu_msg.linear_acceleration.z) > max_linear[2]:
+                        max_linear[2] = abs(imu_msg.linear_acceleration.z)
+                    
+                    if abs(imu_msg.orientation.x) > max_orientation[0]:
+                        max_orientation[0] = abs(imu_msg.orientation.x)
+                    if abs(imu_msg.orientation.y) > max_orientation[1]:
+                        max_orientation[1] = abs(imu_msg.orientation.y)
+                    if abs(imu_msg.orientation.z) > max_orientation[2]:
+                        max_orientation[2] = abs(imu_msg.orientation.z)
+                    if abs(imu_msg.orientation.w) > max_orientation[3]:
+                        max_orientation[3] = abs(imu_msg.orientation.w)
+                        
+                    # Button handling
+                    if dpg.is_item_clicked(reset_button):
+                        max_angular = [0,0,0]
+                        max_linear = [0,0,0]
+                        max_orientation = [0,0,0,0]
+                    dpg.set_value(text_max_angular_vel,
+                                  f"MAX Angular: ({max_angular[0]:.2f}, {max_angular[1]:.2f}, {max_angular[2]:.2f}) [x, y, z]")
+                    dpg.set_value(text_max_linear_acc,
+                                  f"MAX Linear: ({max_linear[0]:.2f}, {max_linear[1]:.2f}, {max_linear[2]:.2f}) [x, y, z]")
+                    dpg.set_value(text_max_orientation,
+                                  f"MAX Orientation: ({max_orientation[0]:.2f}, {max_orientation[1]:.2f}, {max_orientation[2]:.2f}, {max_orientation[3]:.2f}) [x, y, z, w]")
 
                     dpg.set_value(text_angular_vel,
                                   f"Angular Velocity: ({imu_msg.angular_velocity.x:.2f}, {imu_msg.angular_velocity.y:.2f}, {imu_msg.angular_velocity.z:.2f}) [x, y, z]")
