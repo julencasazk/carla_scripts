@@ -29,14 +29,97 @@ AXIS_MAP = {
 }
 
 
-def dash_cam(args, img_queue, img_lock, imu_data_queue):
+# --- 3D orientation helpers (wireframe cube + axes projected to 2D) ---
 
+def _rpy_deg_to_rotmat(roll_deg: float, pitch_deg: float, yaw_deg: float):
+    rx = math.radians(roll_deg)
+    ry = math.radians(pitch_deg)
+    rz = math.radians(yaw_deg)
+
+    cx, sx = math.cos(rx), math.sin(rx)
+    cy, sy = math.cos(ry), math.sin(ry)
+    cz, sz = math.cos(rz), math.sin(rz)
+
+    # R = Rz(yaw) @ Ry(pitch) @ Rx(roll)
+    Rx = np.array([[1, 0, 0],
+                   [0, cx, -sx],
+                   [0, sx,  cx]], dtype=np.float32)
+    Ry = np.array([[ cy, 0, sy],
+                   [  0, 1,  0],
+                   [-sy, 0, cy]], dtype=np.float32)
+    Rz = np.array([[cz, -sz, 0],
+                   [sz,  cz, 0],
+                   [ 0,   0, 1]], dtype=np.float32)
+    return (Rz @ Ry @ Rx).astype(np.float32)
+
+def _project_points(points_xyz: np.ndarray, width: int, height: int, f: float = 180.0, cam_d: float = 4.0):
+    # Perspective projection onto drawlist space
+    cx, cy = width * 0.5, height * 0.5
+    xs, ys = [], []
+    for x, y, z in points_xyz:
+        zc = z + cam_d
+        zc = 0.01 if zc <= 0.01 else zc
+        s = f / zc
+        xs.append(cx + x * s)
+        ys.append(cy - y * s)
+    return np.stack([xs, ys], axis=1)
+
+def _draw_orientation(dl_tag: int, roll: float, pitch: float, yaw: float, size=(320, 320)):
+    w, h = size
+    dpg.delete_item(dl_tag, children_only=True)
+
+    # Model: unit cube and axes
+    cube = np.array([
+        [-1, -1, -1], [ 1, -1, -1], [ 1,  1, -1], [-1,  1, -1],
+        [-1, -1,  1], [ 1, -1,  1], [ 1,  1,  1], [-1,  1,  1],
+    ], dtype=np.float32) * 0.9
+    edges = [
+        (0,1),(1,2),(2,3),(3,0),  # bottom
+        (4,5),(5,6),(6,7),(7,4),  # top
+        (0,4),(1,5),(2,6),(3,7),  # verticals
+    ]
+    origin = np.array([[0,0,0]], dtype=np.float32)
+    axes = np.array([
+        [1.5, 0.0, 0.0],  # X red
+        [0.0, 1.5, 0.0],  # Y green
+        [0.0, 0.0, 1.5],  # Z blue
+    ], dtype=np.float32)
+
+    # Rotate
+    R = _rpy_deg_to_rotmat(roll, pitch, yaw)
+    cube_r = (cube @ R.T)
+    origin_r = (origin @ R.T)
+    axes_r = (axes @ R.T)
+
+    # Project
+    cube_2d = _project_points(cube_r, w, h)
+    origin_2d = _project_points(origin_r, w, h)[0]
+    axes_2d = _project_points(axes_r, w, h)
+
+    # Draw cube
+    for a, b in edges:
+        dpg.draw_line(cube_2d[a], cube_2d[b], color=(200, 200, 200, 255), thickness=2, parent=dl_tag)
+
+    # Draw axes from origin
+    colors = [(255, 80, 80, 255), (80, 255, 80, 255), (80, 160, 255, 255)]  # X, Y, Z
+    for i in range(3):
+        dpg.draw_line(origin_2d, axes_2d[i], color=colors[i], thickness=3, parent=dl_tag)
+
+    # Axis labels
+    label_offset = 6
+    labels = ["X", "Y", "Z"]
+    for i in range(3):
+        p = axes_2d[i]
+        dpg.draw_text((p[0] + label_offset, p[1] + label_offset), labels[i], color=colors[i], size=14, parent=dl_tag)
+
+def dash_cam(args, img_queue, img_lock, imu_data_queue):
     if args.dpg:
         dpg.create_context()
         try:
             tex_tag = None
             img_item = None
             cur_w = cur_h = 0
+            last_rpy = (0.0, 0.0, 0.0)  # roll, pitch, yaw (deg)
 
             # Wait for first frame (blocking, no backlog created)
             first_payload = None
@@ -60,24 +143,35 @@ def dash_cam(args, img_queue, img_lock, imu_data_queue):
 
             with dpg.window(label="Dashboard Camera", tag="cam_window"):
                 img_item = dpg.add_image(tex_tag, width=cur_w, height=cur_h)
-            
-            with dpg.window(label="IMU_Data", tag="data_window", pos=(cur_w, 0)):
+
+            # IMU text window
+            with dpg.window(label="IMU_Data", tag="data_window", pos=(cur_w + 8, 0), width=340, height=200):
                 text_angular_vel = dpg.add_text("Angular Velocity: (0, 0, 0) [x, y, z]")
                 text_linear_acc = dpg.add_text("Linear Acceleration: (0, 0, 0) [x, y, z]")
                 text_orientation = dpg.add_text("Orientation: (0, 0, 0, 0) [x, y, z, w]")
-                
-                
 
-            dpg.create_viewport(title="Dashboard Camera", width=cur_w + 16, height=cur_h + 39)
+            # Orientation wireframe window + drawlist
+            with dpg.window(label="IMU Orientation", tag="orient_window", pos=(cur_w + 8, 210), width=340, height=360):
+                orient_drawlist = dpg.add_drawlist(width=320, height=320, tag="orient_drawlist")
+
+            dpg.create_viewport(
+                title="Dashboard Camera",
+                width=cur_w + 16 + 360,
+                height=max(cur_h + 39, 210 + 360)
+            )
             dpg.setup_dearpygui()
             dpg.show_viewport()
 
             while dpg.is_dearpygui_running():
+                # Drain to latest frame
+                payload = None
                 try:
-                    payload = img_queue.get_nowait()
+                    while True:
+                        payload = img_queue.get_nowait()
                 except queue.Empty:
                     pass
-                else:
+
+                if payload:
                     raw_bytes, width, height = payload
                     if width != cur_w or height != cur_h:
                         if tex_tag is not None:
@@ -90,16 +184,28 @@ def dash_cam(args, img_queue, img_lock, imu_data_queue):
                     arr = np.frombuffer(raw_bytes, dtype=np.uint8).reshape((height, width, 4))
                     rgba = arr[:, :, [2, 1, 0, 3]].astype(np.float32) / 255.0
                     dpg.set_value(tex_tag, rgba.flatten().tolist())
-                    
+
+                # Drain to latest IMU payload
+                data_payload = None
                 try:
-                    data_payload = imu_data_queue.get_nowait()
+                    while True:
+                        data_payload = imu_data_queue.get_nowait()
                 except queue.Empty:
                     pass
-                else:
+
+                if data_payload:
                     imu_msg, roll_carla, pitch_carla, yaw_carla = data_payload
-                    dpg.set_value(text_angular_vel, f"Angular Velocity: ({imu_msg.angular_velocity.x:.2f}, {imu_msg.angular_velocity.y:.2f}, {imu_msg.angular_velocity.z:.2f}) [x, y, z]")
-                    dpg.set_value(text_linear_acc, f"Linear Acceleration: ({imu_msg.linear_acceleration.x:.2f}, {imu_msg.linear_acceleration.y:.2f}, {imu_msg.linear_acceleration.z:.2f}) [x, y, z]")
-                    dpg.set_value(text_orientation, f"Orientation: ({imu_msg.orientation.x:.2f}, {imu_msg.orientation.y:.2f}, {imu_msg.orientation.z:.2f}, {imu_msg.orientation.w:.2f}) [x, y, z, w]")
+                    last_rpy = (roll_carla, pitch_carla, yaw_carla)
+
+                    dpg.set_value(text_angular_vel,
+                                  f"Angular Velocity: ({imu_msg.angular_velocity.x:.2f}, {imu_msg.angular_velocity.y:.2f}, {imu_msg.angular_velocity.z:.2f}) [x, y, z]")
+                    dpg.set_value(text_linear_acc,
+                                  f"Linear Acceleration: ({imu_msg.linear_acceleration.x:.2f}, {imu_msg.linear_acceleration.y:.2f}, {imu_msg.linear_acceleration.z:.2f}) [x, y, z]")
+                    dpg.set_value(text_orientation,
+                                  f"Orientation: ({imu_msg.orientation.x:.2f}, {imu_msg.orientation.y:.2f}, {imu_msg.orientation.z:.2f}, {imu_msg.orientation.w:.2f}) [x, y, z, w]")
+
+                # Update orientation drawlist every frame using last_rpy
+                _draw_orientation(orient_drawlist, *last_rpy, size=(320, 320))
 
                 dpg.render_dearpygui_frame()
                 time.sleep(0.001)
@@ -206,11 +312,13 @@ class CarlaRosNode(Node):
         pitch_carla = self._base_rot.pitch + p_m
         yaw_carla   = self._base_rot.yaw   + y_m
         
+
+        r_msg, p_msg, y_msg  = pitch_carla, yaw_carla, roll_carla
         imu_data = [
             msg,
-            roll_carla,
-            pitch_carla,
-            yaw_carla
+            r_msg,
+            p_msg,
+            y_msg
         ]
         
         try:
