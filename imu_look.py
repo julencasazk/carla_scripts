@@ -15,9 +15,10 @@ import multiprocessing
 import time
 import threading
 import math
+import dearpygui.dearpygui as dpg
 
 
-
+use_dpg = False
 
 # Axis Map for quickly changing axis from real IMU to CARLA.
 # e.g. rolling the imu left pitches carla up: 'PITCH_FROM': ('roll', -1)
@@ -28,34 +29,109 @@ AXIS_MAP = {
 }
 
 
-def dash_cam(img_queue, img_lock):
-    time.sleep(5) 
-    cv2.namedWindow("Dashboard Camera", cv2.WINDOW_NORMAL)
-    try:
-        while True:
-            payload = None
-            try:
-                with img_lock:
+def dash_cam(args, img_queue, img_lock, imu_data_queue):
+
+    if args.dpg:
+        dpg.create_context()
+        try:
+            tex_tag = None
+            img_item = None
+            cur_w = cur_h = 0
+
+            # Wait for first frame (blocking, no backlog created)
+            first_payload = None
+            while first_payload is None:
+                try:
+                    first_payload = img_queue.get(timeout=0.5)
+                except queue.Empty:
+                    continue
+                if first_payload is None:
+                    dpg.destroy_context()
+                    return
+
+            raw_bytes, width, height = first_payload
+            arr = np.frombuffer(raw_bytes, dtype=np.uint8).reshape((height, width, 4))
+            rgba = arr[:, :, [2, 1, 0, 3]].astype(np.float32) / 255.0
+            init_data = rgba.flatten().tolist()
+            cur_w, cur_h = width, height
+
+            with dpg.texture_registry():
+                tex_tag = dpg.add_dynamic_texture(cur_w, cur_h, init_data)
+
+            with dpg.window(label="Dashboard Camera", tag="cam_window"):
+                img_item = dpg.add_image(tex_tag, width=cur_w, height=cur_h)
+            
+            with dpg.window(label="IMU_Data", tag="data_window", pos=(cur_w, 0)):
+                text_angular_vel = dpg.add_text("Angular Velocity: (0, 0, 0) [x, y, z]")
+                text_linear_acc = dpg.add_text("Linear Acceleration: (0, 0, 0) [x, y, z]")
+                text_orientation = dpg.add_text("Orientation: (0, 0, 0, 0) [x, y, z, w]")
+                
+                
+
+            dpg.create_viewport(title="Dashboard Camera", width=cur_w + 16, height=cur_h + 39)
+            dpg.setup_dearpygui()
+            dpg.show_viewport()
+
+            while dpg.is_dearpygui_running():
+                try:
                     payload = img_queue.get_nowait()
-            except queue.Empty:
-                time.sleep(0.01)
-                continue 
-            if payload is None:
-                break   
-            
-            raw_bytes, width, height = payload
-            array = np.frombuffer(raw_bytes, dtype=np.uint8)
-            array = np.reshape(array, (height, width, 4))
-            array = array[:,:,:3] # Discard alpha channel
-            
-            cv2.imshow("Dashboard Camera", array)
-            if cv2.waitKey(1) & 0xFF == ord('q'):
-                break
-            
-    finally:
-        print("Cleaning up OpenCV...")
-        cv2.destroyAllWindows()
-        print("Destroyed all windows")
+                except queue.Empty:
+                    pass
+                else:
+                    raw_bytes, width, height = payload
+                    if width != cur_w or height != cur_h:
+                        if tex_tag is not None:
+                            dpg.delete_item(tex_tag)
+                        with dpg.texture_registry():
+                            tex_tag = dpg.add_dynamic_texture(width, height, [0.0] * (width * height * 4))
+                        dpg.configure_item(img_item, texture_tag=tex_tag, width=width, height=height)
+                        cur_w, cur_h = width, height
+
+                    arr = np.frombuffer(raw_bytes, dtype=np.uint8).reshape((height, width, 4))
+                    rgba = arr[:, :, [2, 1, 0, 3]].astype(np.float32) / 255.0
+                    dpg.set_value(tex_tag, rgba.flatten().tolist())
+                    
+                try:
+                    data_payload = imu_data_queue.get_nowait()
+                except queue.Empty:
+                    pass
+                else:
+                    imu_msg, roll_carla, pitch_carla, yaw_carla = data_payload
+                    dpg.set_value(text_angular_vel, f"Angular Velocity: ({imu_msg.angular_velocity.x:.2f}, {imu_msg.angular_velocity.y:.2f}, {imu_msg.angular_velocity.z:.2f}) [x, y, z]")
+                    dpg.set_value(text_linear_acc, f"Linear Acceleration: ({imu_msg.linear_acceleration.x:.2f}, {imu_msg.linear_acceleration.y:.2f}, {imu_msg.linear_acceleration.z:.2f}) [x, y, z]")
+                    dpg.set_value(text_orientation, f"Orientation: ({imu_msg.orientation.x:.2f}, {imu_msg.orientation.y:.2f}, {imu_msg.orientation.z:.2f}, {imu_msg.orientation.w:.2f}) [x, y, z, w]")
+
+                dpg.render_dearpygui_frame()
+                time.sleep(0.001)
+
+        finally:
+            dpg.destroy_context()
+    else:
+        # Dashcam using cv2
+        cv2.namedWindow("Dashboard Camera", cv2.WINDOW_NORMAL)
+        try:
+            while True:
+                try:
+                    payload = img_queue.get_nowait()
+                except queue.Empty:
+                    time.sleep(0.01)
+                    continue
+                if payload is None:
+                    break
+
+                raw_bytes, width, height = payload
+                array = np.frombuffer(raw_bytes, dtype=np.uint8)
+                array = np.reshape(array, (height, width, 4))
+                array = array[:, :, :3]  # Discard alpha
+
+                cv2.imshow("Dashboard Camera", array)
+                if cv2.waitKey(1) & 0xFF == ord('q'):
+                    break
+
+        finally:
+            print("Cleaning up OpenCV...")
+            cv2.destroyAllWindows()
+            print("Destroyed all windows")
 
 def quat_to_euler_deg(x, y, z, w):
     # Normalize quaternion
@@ -83,7 +159,7 @@ def quat_to_euler_deg(x, y, z, w):
     return math.degrees(roll), math.degrees(pitch), math.degrees(yaw)
 
 class CarlaRosNode(Node):
-    def __init__(self, camera, base_transform, abs_rot_enable):
+    def __init__(self, camera, base_transform, abs_rot_enable, imu_data_queue):
         super().__init__('carla_cam_control')
         qos = rclpy.qos.QoSProfile(depth=10, reliability=rclpy.qos.QoSReliabilityPolicy.BEST_EFFORT)
         self._imu_sub = self.create_subscription(Imu, 'imu_data', self.imu_cb, qos)
@@ -95,6 +171,7 @@ class CarlaRosNode(Node):
         self._last_y_m = None
         self._abs_rot_enable = abs_rot_enable
         self._first_reading_done = False
+        self._imu_data_queue = imu_data_queue
         
     # Replace axis between them following the map
     def _apply_axis_map(self, roll, pitch, yaw):
@@ -128,6 +205,23 @@ class CarlaRosNode(Node):
         roll_carla  = self._base_rot.roll  + r_m
         pitch_carla = self._base_rot.pitch + p_m
         yaw_carla   = self._base_rot.yaw   + y_m
+        
+        imu_data = [
+            msg,
+            roll_carla,
+            pitch_carla,
+            yaw_carla
+        ]
+        
+        try:
+            while True:
+                self._imu_data_queue.get_nowait()
+        except queue.Empty:
+            pass
+        try:
+            self._imu_data_queue.put_nowait(imu_data)
+        except queue.Full:
+            pass
 
         new_rot = carla.Rotation(pitch=pitch_carla, yaw=yaw_carla, roll=roll_carla)
         self._camera.set_transform(carla.Transform(self._base_loc, new_rot))
@@ -135,9 +229,9 @@ class CarlaRosNode(Node):
     
         
     
-def ros_background_spin(camera, base_transform, abs_rot_enable):
+def ros_background_spin(camera, base_transform, abs_rot_enable, imu_data_queue):
     rclpy.init()
-    node = CarlaRosNode(camera, base_transform, abs_rot_enable)
+    node = CarlaRosNode(camera, base_transform, abs_rot_enable, imu_data_queue)
     executor = rclpy.executors.SingleThreadedExecutor()
     executor.add_node(node)
     t = threading.Thread(target=executor.spin, daemon=True)
@@ -146,13 +240,8 @@ def ros_background_spin(camera, base_transform, abs_rot_enable):
         
         
 
-def main(img_queue, img_lock):
-    parser = argparse.ArgumentParser(description="Publish vehicle data and control the vehicle with ROS")
-    parser.add_argument('--port', type=int, default=2000, help="CARLA port")
-    parser.add_argument('--host', type=str, default='localhost', help="CARLA port")
-    parser.add_argument('--abs', action='store_true', help="Use absolute rotation from IMU")
-    args = parser.parse_args()
-    
+def main(args, img_queue, img_lock, imu_data_queue):
+
     print("CARLA Camera controller with IMU")
     print("Mash Ctrl+C to exit, idk")
     
@@ -184,12 +273,21 @@ def main(img_queue, img_lock):
     
     # When camera gets an image, pass it to CV2 process
     def cam_callback(img):
-        with img_lock:
-            img_queue.put((bytes(img.raw_data), img.width, img.height))
-    
+        frame = (bytes(img.raw_data), img.width, img.height)
+        try:
+            while True:
+                img_queue.get_nowait()
+        except queue.Empty:
+            pass
+        try:
+            img_queue.put_nowait(frame)
+        except queue.Full:
+            # Rare race; drop and move on
+            pass
+
     cam.listen(cam_callback)
-    
-    executor, node, ros_t = ros_background_spin(cam, cam_transform, args.abs)
+
+    executor, node, ros_t = ros_background_spin(cam, cam_transform, args.abs, imu_data_queue)
         
     print(f"Waiting for sensors to start...")
     time.sleep(5)
@@ -210,20 +308,36 @@ def main(img_queue, img_lock):
             executor.shutdown(timeout_sec=1.0)
             node.destroy_node()
             rclpy.shutdown()
-            with img_lock:
-                img_queue.put(None)
+            # Send shutdown sentinel without blocking
+            try:
+                while True:
+                    img_queue.get_nowait()
+            except queue.Empty:
+                pass
+            try:
+                img_queue.put_nowait(None)
+            except queue.Full:
+                pass
         except Exception:
             print(f"Error exiting correctly!")
-            
 
 if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description="Publish vehicle data and control the vehicle with ROS")
+    parser.add_argument('--port', type=int, default=2000, help="CARLA port")
+    parser.add_argument('--host', type=str, default='localhost', help="CARLA port")
+    parser.add_argument('--abs', action='store_true', help="Use absolute rotation from IMU")
+    parser.add_argument('--dpg', action='store_true', help="Use DearPyGUI for dashcam instead of OpenCV")
+    args = parser.parse_args()
+
+    # Only keep the latest frame
+    img_queue = multiprocessing.Queue(maxsize=1)
+    img_lock = multiprocessing.Lock()  # unused
     
-    img_queue = multiprocessing.Queue()
-    img_lock = multiprocessing.Lock()
+    imu_data_queue = multiprocessing.Queue(maxsize=1)
     
     processes = [
-        multiprocessing.Process(target=main, args=(img_queue, img_lock)),
-        multiprocessing.Process(target=dash_cam, args=(img_queue, img_lock))
+        multiprocessing.Process(target=main, args=(args, img_queue, img_lock, imu_data_queue)),
+        multiprocessing.Process(target=dash_cam, args=(args, img_queue, img_lock, imu_data_queue))
     ]
     
     for p in processes:
