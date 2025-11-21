@@ -47,7 +47,7 @@ class CarlaROSNode(Node):
         self.a = dend / dend[0]
         self.b = numd / dend[0]
         self.na = len(self.a) - 1
-        self.nb = len(self.b)
+        self.nb = len(self.b) - 1
         self.y_prev = np.zeros(self.na)
         self.u_prev = np.zeros(self.nb)
         # History (for plotting)
@@ -94,13 +94,22 @@ class CarlaROSNode(Node):
         self._r_val = float(msg.data)
 
     def step_callback(self):
-        # Lightweight 100 Hz update
         u_curr = self._u_val
-        self.u_prev = np.roll(self.u_prev, 1)
-        self.u_prev[0] = u_curr
-        y_curr = -np.dot(self.a[1:], self.y_prev) + np.dot(self.b, self.u_prev)
-        self.y_prev = np.roll(self.y_prev, 1)
-        self.y_prev[0] = y_curr
+
+        # Build input vector [u[k], u[k-1], ...]
+        if self.nb > 0:
+            u_vec = np.concatenate(([u_curr], self.u_prev))
+        else:
+            u_vec = np.array([u_curr])
+
+        y_curr = -np.dot(self.a[1:], self.y_prev) + np.dot(self.b, u_vec)
+
+        # Update histories
+        if self.na > 0:
+            self.y_prev = np.concatenate(([y_curr], self.y_prev[:-1]))
+        if self.nb > 0:
+            self.u_prev = np.concatenate(([u_curr], self.u_prev[:-1]))
+
         self._y_val = y_curr
         pv_msg = Float32(); pv_msg.data = float(y_curr)
         self._pv_pub.publish(pv_msg)
@@ -129,8 +138,13 @@ class CarlaROSNode(Node):
         self.line_r.set_data(self.t_hist, self.r_hist)
         self.line_y.set_data(self.t_hist, self.y_hist)
         self.line_u.set_data(self.t_hist, self.u_hist)
-        self.ax1.set_xlim(max(0, t - self._args.x_window), t + 0.01)
-        self.ax2.set_xlim(max(0, t - self._args.x_window), t + 0.01)
+        # Non-scrolling: fixed 0 .. x_window (hold) or expand 0 .. max(x_window, t)
+        if self._args.hold_x:
+            x_max = self._args.x_window
+        else:
+            x_max = max(self._args.x_window, t)
+        self.ax1.set_xlim(0, x_max)
+        self.ax2.set_xlim(0, x_max)
         if self._args.auto_scale and len(self.y_hist) > 5:
             y_min = min(min(self.r_hist), min(self.y_hist))
             y_max = max(max(self.r_hist), max(self.y_hist))
@@ -156,7 +170,8 @@ def main():
     parser.add_argument('--plot-period', type=float, default=0.1, help="Plot update period (s)")
     parser.add_argument('--no-plot', action='store_true', help="Disable live plotting")
     parser.add_argument('--plot-decimation', type=int, default=5, help="(Unused now) kept for compatibility")
-    parser.add_argument('--x-window', type=float, default=10.0, help="Time window (s) visible on plot")
+    parser.add_argument('--x-window', type=float, default=20.0, help="Initial horizontal window (s)")
+    parser.add_argument('--hold-x', action='store_true', help="Keep x-axis fixed at x-window (no expansion)")
     parser.add_argument('--auto-scale', action='store_true', help="Enable dynamic Y scaling")
     parser.add_argument('--max-points', type=int, default=0, help="Limit stored points (0 = unlimited)")
     parser.add_argument('--jitter-log', action='store_true', help="Log timer period jitter")
