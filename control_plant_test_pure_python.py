@@ -9,7 +9,7 @@ zeta = 0.661
 Td = 0.146
 
 # Simulation / sampling
-Ts = 0.001
+Ts = 0.01
 T_sim = 80.0
 N_steps = int(T_sim / Ts)
 
@@ -89,7 +89,7 @@ class PID:
 # PID gains
 kp = 1.5
 ki = 0.3
-kd = 20
+kd = 0.0
 N_d = 15.0
 kb_aw = 1.0
 u_min, u_max = 0, 100.0
@@ -98,7 +98,7 @@ pid = PID(kp, ki, kd, N_d, Ts, u_min, u_max, kb_aw)
 
 time = np.arange(N_steps) * Ts
 r = np.zeros(N_steps)
-r[time >= 5.0] = 30
+r[time >= 5.0] = 50
 
 y = np.zeros(N_steps)
 u = np.zeros(N_steps)
