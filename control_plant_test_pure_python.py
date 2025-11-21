@@ -68,7 +68,7 @@ class PID:
 
         u_p = self.kp * e
 
-        w = e  # derivative on error
+        w = -measurement # derivative on error
         u_d = self.k_u * self.d_prev + self.k_w * w - self.k_w * self.w_prev
         self.d_prev = u_d
         self.w_prev = w
@@ -87,19 +87,19 @@ class PID:
 
 
 # PID gains
-kp = 1.5
+kp = 1
 ki = 0.3
-kd = 0.0
-N_d = 15.0
+kd = 3
+N_d = 3
 kb_aw = 1.0
-u_min, u_max = 0, 100.0
+u_min, u_max = 0.0, 100.0
 
 pid = PID(kp, ki, kd, N_d, Ts, u_min, u_max, kb_aw)
 
 time = np.arange(N_steps) * Ts
 r = np.zeros(N_steps)
 r[time >= 5.0] = 50
-
+r[time >= 50] = 0
 y = np.zeros(N_steps)
 u = np.zeros(N_steps)
 y_hist = np.zeros(na)
