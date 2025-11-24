@@ -64,7 +64,7 @@ def main(args, img_queue, char_queue, img_lock):
     client.set_timeout(10.0)
     map = client.get_available_maps()
     print(f"Available maps:\n{map}")
-    client.load_world('Town04')
+    client.load_world(args.map)
     time.sleep(10)
     world = client.get_world()
     bp_library = world.get_blueprint_library()
@@ -152,7 +152,22 @@ def main(args, img_queue, char_queue, img_lock):
                 array = np.frombuffer(raw_bytes, dtype=np.uint8)
                 array = np.reshape(array, (height, width, 4))
                 array = array[:, :, :3]  # drop alpha
-                cv2.imwrite(f"spawn_point_imgs/spawn_point_{spawn_point_idx:03d}.png", array)
+                dir_path = f"{args.map}_spawn_point_imgs"
+                os.makedirs(dir_path, exist_ok=True)
+                meta_path = f"{dir_path}/{args.map}_spawn_points.txt"
+                if not os.path.exists(meta_path):
+                    open(meta_path, "w").close()
+                cv2.imwrite(f"{args.map}_spawn_point_imgs/{args.map}_spawn_point_{spawn_point_idx:03d}.png", array)
+                sp = spawn_points[spawn_point_idx]
+                loc, rot = sp.location, sp.rotation
+
+                with open(f"{args.map}_spawn_point_imgs/{args.map}_spawn_points.txt", "a") as f:
+                    f.write(
+                        f"spawn_point_{spawn_point_idx:03d}.png "
+                        f"loc({loc.x:.2f},{loc.y:.2f},{loc.z:.2f}) "
+                        f"rot(pitch={rot.pitch:.2f},yaw={rot.yaw:.2f},roll={rot.roll:.2f})\n"
+                    )
+                
             else:
                 print("Warning: no new frame received for snapshot after teleport")
 
@@ -166,6 +181,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="STM32H7 Algorithm Testing Node")
     parser.add_argument('--host', type=str, help="CARLA host", default='localhost')
     parser.add_argument('--port', type=int, help="CARLA port", default=2000)
+    parser.add_argument('--map', type=str, help="CARLA map to load", default='Town01')
     args = parser.parse_args()
     
     img_lock = multiprocessing.Lock()  # Not used anymore, but kept for signature compatibility
