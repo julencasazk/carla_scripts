@@ -35,25 +35,32 @@ class CarlaROSNode(Node):
         self.Ts = args.Ts
         self.k_step = 0
         self.last_step_monotonic = time.perf_counter()
-        # Discrete plant 
-        # ==============================================
-        k = 0.156; wn = 0.396; zeta = 0.661; Td = 0.146
+
+        # ------------------------------------------------------------------
+        # Discrete plant (same as pure-python simulation: state-space form)
+        # ------------------------------------------------------------------
+        Ts = self.Ts
+        Td = 0.15
         s = ctl.TransferFunction.s
-        G0 = k / (s**2 + 2*zeta*wn*s + wn**2)
+        G0 = 12.68 / (s**2 + 1.076*s + 0.2744)
         num_delay, den_delay = ctl.pade(Td, 1)
-        Gc = G0 * ctl.tf(num_delay, den_delay)
-        Gd = ctl.c2d(Gc, self.Ts, method='tustin')
-        
-        # ==============================================
-        numd, dend = ctl.tfdata(Gd)
-        numd = np.squeeze(numd); dend = np.squeeze(dend)
-        self.a = dend / dend[0]
-        self.b = numd / dend[0]
-        self.na = len(self.a) - 1
-        self.nb = len(self.b) - 1
-        self.y_prev = np.zeros(self.na)
-        self.u_prev = np.zeros(self.nb)
+        H_delay = ctl.tf(num_delay, den_delay)
+        Gc = G0 * H_delay
+        Gd = ctl.c2d(Gc, Ts, method='tustin')
+
+        # Convert to discrete state-space (same as in control_plant_test_pure_python.py)
+        Ad, Bd, Cd, Dd = ctl.ssdata(ctl.ss(Gd))
+        self.Ad = np.asarray(Ad)
+        self.Bd = np.asarray(Bd).reshape(-1)
+        self.Cd = np.asarray(Cd)
+        self.Dd = np.asarray(Dd).reshape(-1)
+
+        # Initial plant state
+        self.x = np.zeros(self.Ad.shape[0])
+
+        # ------------------------------------------------------------------
         # History (for plotting)
+        # ------------------------------------------------------------------
         self.enable_plot = not args.no_plot
         self.max_points = args.max_points
         self.t_hist = []
@@ -97,36 +104,33 @@ class CarlaROSNode(Node):
         self._r_val = float(msg.data)
 
     def step_callback(self):
+        # Current control from microcontroller PID
         u_curr = self._u_val
 
-        # Build input vector [u[k], u[k-1], ...]
-        if self.nb > 0:
-            u_vec = np.concatenate(([u_curr], self.u_prev))
-        else:
-            u_vec = np.array([u_curr])
-
-        y_curr = -np.dot(self.a[1:], self.y_prev) + np.dot(self.b, u_vec)
-
-        # Update histories
-        if self.na > 0:
-            self.y_prev = np.concatenate(([y_curr], self.y_prev[:-1]))
-        if self.nb > 0:
-            self.u_prev = np.concatenate(([u_curr], self.u_prev[:-1]))
+        # State-space update (same as pure-python sim)
+        self.x = self.Ad @ self.x + self.Bd * u_curr
+        y_curr = (self.Cd @ self.x + self.Dd * u_curr).item()
 
         self._y_val = y_curr
-        pv_msg = Float32(); pv_msg.data = float(y_curr)
+        pv_msg = Float32()
+        pv_msg.data = float(y_curr)
         self._pv_pub.publish(pv_msg)
+
         t = self.k_step * self.Ts
         self.k_step += 1
+
         # Store history
-        self.t_hist.append(t); self.r_hist.append(self._r_val)
-        self.y_hist.append(y_curr); self.u_hist.append(u_curr)
+        self.t_hist.append(t)
+        self.r_hist.append(self._r_val)
+        self.y_hist.append(y_curr)
+        self.u_hist.append(u_curr)
         if self.max_points and len(self.t_hist) > self.max_points:
             trim = len(self.t_hist) - self.max_points
             self.t_hist = self.t_hist[trim:]
             self.r_hist = self.r_hist[trim:]
             self.y_hist = self.y_hist[trim:]
             self.u_hist = self.u_hist[trim:]
+
         # Jitter logging (optional)
         if self._args.jitter_log and (self.k_step % self._args.jitter_log_interval == 0):
             now = time.perf_counter()
@@ -158,16 +162,15 @@ class CarlaROSNode(Node):
                 self.ax2.set_ylim(u_min - 0.05 * abs(u_min + 1e-9),
                                   u_max + 0.05 * abs(u_max + 1e-9))
         self.fig.canvas.draw_idle()
-        # flush_events may not exist; guard it
         if hasattr(self.fig.canvas, "flush_events"):
             self.fig.canvas.flush_events()
 
 def main():
     parser = argparse.ArgumentParser(description="Real-time plant simulation interfaced with external PID (STM32).")
-    parser.add_argument('--kp', type=float, default=1.5)
-    parser.add_argument('--ki', type=float, default=0.3)
-    parser.add_argument('--kd', type=float, default=0.0)
-    parser.add_argument('--N', type=float, default=15.0)
+    parser.add_argument('--kp', type=float, default=0.47446807)
+    parser.add_argument('--ki', type=float, default=0.15472707)
+    parser.add_argument('--kd', type=float, default=7.83353195)
+    parser.add_argument('--N', type=float, default=20.0)
     parser.add_argument('--kaw', type=float, default=1.0)
     parser.add_argument('--Ts', type=float, default=0.01, help="Sampling period (s)")
     parser.add_argument('--plot-period', type=float, default=0.1, help="Plot update period (s)")
@@ -198,7 +201,6 @@ def main():
                 if now - last_plot >= args.plot_period:
                     node.update_plot()
                     last_plot = now
-                    # small non-blocking UI tick
                     plt.pause(0.001)
             time.sleep(0.002)
     except KeyboardInterrupt:
