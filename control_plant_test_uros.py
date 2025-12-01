@@ -35,13 +35,16 @@ class CarlaROSNode(Node):
         self.Ts = args.Ts
         self.k_step = 0
         self.last_step_monotonic = time.perf_counter()
-        # Build discrete plant (unchanged)
+        # Discrete plant 
+        # ==============================================
         k = 0.156; wn = 0.396; zeta = 0.661; Td = 0.146
         s = ctl.TransferFunction.s
         G0 = k / (s**2 + 2*zeta*wn*s + wn**2)
         num_delay, den_delay = ctl.pade(Td, 1)
         Gc = G0 * ctl.tf(num_delay, den_delay)
         Gd = ctl.c2d(Gc, self.Ts, method='tustin')
+        
+        # ==============================================
         numd, dend = ctl.tfdata(Gd)
         numd = np.squeeze(numd); dend = np.squeeze(dend)
         self.a = dend / dend[0]
