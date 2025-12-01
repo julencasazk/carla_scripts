@@ -50,11 +50,11 @@ def pso(objetive, bounds, num_particles=30, max_it=50, w=0.7, c1=1.5, c2=1.5,
 
     w_sse = 1.0
     w_os = 1.0
-    w_ts_tr = 0.45
-    w_rvg = 0.8
-    w_odj = 0.8
-    w_u = 0.0
-    w_du = 0.0
+    w_ts_tr = 0.8
+    w_rvg = 0.2
+    w_odj = 0.2
+    w_u = 0.1
+    w_du = 0.1
     w_sat = 0.3
 
     weights = np.array([
@@ -195,6 +195,12 @@ def pso(objetive, bounds, num_particles=30, max_it=50, w=0.7, c1=1.5, c2=1.5,
             history.append(gbest_value)
             if verbose:
                 print(f"Iteration {it} - Best cost: {gbest_value:.6f}")
+                # Debug printing
+                print(f"Iter {it}: best_J={gbest_value:.4f}")
+                print("  best_x:", gbest_position)
+                print("  sample metrics[0]:", metrics_arr[0])
+                print("  sample metrics[1]:", metrics_arr[1])
+                print("  mean J:", np.mean(J_values))
         except KeyboardInterrupt:
             print(f"INTERRUPTED Iteration {it}, best values:")
             break
@@ -420,9 +426,9 @@ def main(args):
         )
 
     bounds = [
-        (0.0, 20.0),
-        (0.0, 5.0),
-        (0.0, 5.0)
+        (0.0, 2.0),
+        (0.0, 1.0),
+        (0.0, 10.0)
     ]
 
     seed = args.seed
