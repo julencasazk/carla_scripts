@@ -28,9 +28,9 @@ Cd = np.asarray(Cd)
 Dd = np.asarray(Dd).reshape(-1)
 
 # PID gains (from PSO)
-kp = 0.63585695
-ki = 0.85758202
-kd = 3.63651481
+kp = 0.47446807
+ki = 0.15472707
+kd = 7.83353195
 
 N_d = 20
 kb_aw = 1.0
@@ -41,7 +41,7 @@ pid = PID(kp, ki, kd, N_d, Ts, u_min, u_max, kb_aw, der_on_meas=True)
 # Time and reference
 time = np.arange(N_steps + 1) * Ts   # store y[0..N_steps]
 r = np.zeros_like(time)
-r[time >= 5.0] = 40.0
+r[time >= 5.0] = 15.0
 r[time >= 50.0] = 0.0
 
 y = np.zeros_like(time)
