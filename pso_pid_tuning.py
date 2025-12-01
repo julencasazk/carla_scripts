@@ -62,8 +62,8 @@ def pso(objetive, bounds, num_particles=30, max_it=50, w=0.7, c1=1.5, c2=1.5,
 
     history = [gbest_value]
 
-    if verbose:
-        print(f"Iteration 0 - best cost: {gbest_value:.6f}")
+    print(f"Iteration 0 - best cost: {gbest_value:.6f}")
+    print(f"    Best position: {gbest_position}")
 
     # Main loop
     for it in range(1, max_it + 1):
@@ -103,8 +103,8 @@ def pso(objetive, bounds, num_particles=30, max_it=50, w=0.7, c1=1.5, c2=1.5,
                     gbest_position = particles[i].copy()
 
             history.append(gbest_value)
-            if verbose:
-                print(f"Iteration {it} - Best cost: {gbest_value:.6f}")
+            print(f"Iteration {it} - Best cost: {gbest_value:.6f}")
+            print(f"    Best position: {gbest_position}")
         except KeyboardInterrupt:
             print(f"INTERRUPTED Iteration {it}, best values:")
             break
@@ -112,8 +112,7 @@ def pso(objetive, bounds, num_particles=30, max_it=50, w=0.7, c1=1.5, c2=1.5,
     if log_path is not None:
         with open(log_path, 'w') as f:
             json.dump(logs, f, indent=2, default=float)
-        if verbose:
-            print(f"Saved log to {log_path}")
+        print(f"Saved log to {log_path}")
 
     return gbest_position, gbest_value, history
 
@@ -220,8 +219,9 @@ def pid_cost_custom_with_Gd(x,
                             w_ts_tr=0.45,
                             w_rvg=0.35,
                             w_odj=0.35,
-                            w_cec=0.3,
-                            bounded: bool = True):
+                            w_cec=0.8,
+                            bounded: bool = True,
+                            verbose=False):
     """
     Cost for PSO iteration. If bounded=True, uses normalized/clipped J1..J6.
     If bounded=False, uses raw/unbounded contributions to inspect magnitudes.
@@ -331,7 +331,7 @@ def pid_cost_custom_with_Gd(x,
 
     RVG_raw = w_d_sse * dSSE + w_d_os * dOS + w_d_ts * dTsTr
 
-    RVG_target = 1.0 
+    RVG_target = 0.0 
     RVG_max = 5.0
 
     if RVG_raw <= RVG_target:
@@ -366,7 +366,7 @@ def pid_cost_custom_with_Gd(x,
     else:
         ODJ_raw = 0.0
 
-    ODJ_target = 0.003
+    ODJ_target = 0.0
     ODJ_max = 0.1
     if ODJ_raw <= ODJ_target:
         j5 = 0.0
@@ -380,10 +380,10 @@ def pid_cost_custom_with_Gd(x,
     u_range = max(u_max - u_min, 1e-6)
 
 
-    u_rms_target = 0.03 * u_range    # 3% of range
+    u_rms_target = 0.0 * u_range    # 3% of range
     u_rms_max    = 0.5 * u_range    # 10% of range
 
-    du_rms_target = 0.005 * u_range  # 0.5% of range
+    du_rms_target = 0.0 * u_range  # 0.5% of range
     du_rms_max    = 0.2  * u_range  # 2% of range
 
     sat_target = 0.00
@@ -416,7 +416,7 @@ def pid_cost_custom_with_Gd(x,
         j6_sat = min(j6_sat, 3.0)
 
     w_cec_u = 1.0
-    w_cec_du = 1.0
+    w_cec_du = 2.0
     w_cec_sat = 1.0
 
     CEC_raw = w_cec_u * j6_u + w_cec_du * j6_du + w_cec_sat * j6_sat
@@ -452,23 +452,23 @@ def pid_cost_custom_with_Gd(x,
         w_odj * J5_contrib +
         w_cec * J6_contrib
     )
+    if verbose:
+        print(f"Costs for this iteration (bounded={bounded}):")
+        print(f"  J1: {J1_contrib:.6f}")
+        print(f"  J2: {J2_contrib:.6f}")
+        print(f"  J3: {J3_contrib:.6f}")
+        print(f"  J4: {J4_contrib:.6f}")
+        print(f"  J5: {J5_contrib:.6f}")
+        print(f"  J6: {J6_contrib:.6f}")
 
-    print(f"Costs for this iteration (bounded={bounded}):")
-    print(f"  J1: {J1_contrib:.6f}")
-    print(f"  J2: {J2_contrib:.6f}")
-    print(f"  J3: {J3_contrib:.6f}")
-    print(f"  J4: {J4_contrib:.6f}")
-    print(f"  J5: {J5_contrib:.6f}")
-    print(f"  J6: {J6_contrib:.6f}")
-
-    print("Weighted contributions:")
-    print(f"  w_sse*J1:   {w_sse * J1_contrib:.6f}")
-    print(f"  w_os*J2:    {w_os * J2_contrib:.6f}")
-    print(f"  w_ts_tr*J3: {w_ts_tr * J3_contrib:.6f}")
-    print(f"  w_rvg*J4:   {w_rvg * J4_contrib:.6f}")
-    print(f"  w_odj*J5:   {w_odj * J5_contrib:.6f}")
-    print(f"  w_cec*J6:   {w_cec * J6_contrib:.6f}")
-    print(f"  Total cost J: {j:.6f}\n")
+        print("Weighted contributions:")
+        print(f"  w_sse*J1:   {w_sse * J1_contrib:.6f}")
+        print(f"  w_os*J2:    {w_os * J2_contrib:.6f}")
+        print(f"  w_ts_tr*J3: {w_ts_tr * J3_contrib:.6f}")
+        print(f"  w_rvg*J4:   {w_rvg * J4_contrib:.6f}")
+        print(f"  w_odj*J5:   {w_odj * J5_contrib:.6f}")
+        print(f"  w_cec*J6:   {w_cec * J6_contrib:.6f}")
+        print(f"  Total cost J: {j:.6f}\n")
 
     if bounded:
         for name, val in [("J1_SSE", j1), ("J2_OS", j2), ("J3_Ts_Tr", j3),
@@ -549,13 +549,14 @@ def main(args):
             N=N_filt, Ts=Ts,
             u_min=u_min, u_max=u_max, kb_aw=kb_aw,
             t_final=T_sim, ref=setpoint,
-            bounded=True
+            bounded=True,
+            verbose=args.v
         )
 
     bounds = [
-        (0.0, 20.0),  # Kp
-        (0.0, 5.0),   # Ki
-        (0.0, 5.0)    # Kd
+        (0.0, 2.0),  # Kp
+        (0.0, 1.0),   # Ki
+        (0.0, 10.0)    # Kd
     ]
 
     seed = np.random.randint(0, 10000)
