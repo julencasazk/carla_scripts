@@ -36,7 +36,7 @@ class PID:
         u_p = self.kp * e
 
         
-        w = e if self.der_on_meas else (-measurement) # derivative on error
+        w = e if not self.der_on_meas else (-measurement)
         u_d = self.k_u * self.d_prev + self.k_w * w - self.k_w * self.w_prev
         self.d_prev = u_d
         self.w_prev = w
