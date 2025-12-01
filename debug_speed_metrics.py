@@ -77,8 +77,44 @@ def main():
     kp = 1.74258599
     ki = 0.10109199
     kd = 4.16309923
-    run_case(kp, ki, kd, "Ranked cost scaling", ax_y, ax_u, "C5")
-      
+    #run_case(kp, ki, kd, "Ranked cost scaling", ax_y, ax_u, "C5")
+
+    # Normalized cost scaling, scaling with max and min each iteration
+    kp = 0.78735842
+    ki = 0.48564073
+    kp = 6.38541476
+    #run_case(kp, ki, kd, "Normalized scaling 1", ax_y, ax_u, "C6")
+    
+    
+    # Normalized cost scaling, scaling with max and min each iteration ANOTHER ONE
+    kp = 1.55804038
+    ki = 0.49750068
+    kp = 5.31105199
+    #run_case(kp, ki, kd, "Normalized scaling 2", ax_y, ax_u, "C7")
+    
+    # Normal PID tuning, but with no target theshold, minimum 0.0
+    kp = 0.60132401
+    ki = 0.25121954
+    kd = 7.73220397
+    run_case(kp, ki, kd, "Normal PID without _target", ax_y, ax_u, "C8")
+    
+    # Normalized with offline metrics (median InterQuartile Range), new method in pid_tuning_offline_normalize.py
+    kp = 0.60868111
+    ki = 0.19973763
+    kd = 10.0
+    #run_case(kp, ki, kd, "Offline normalization (median IQR)", ax_y, ax_u, "C9")
+
+    # Another manually bound test (pso_pid_tuning.py)
+    kp = 0.70008584
+    ki = 0.29906212
+    kd = 8.73205437
+    run_case(kp, ki, kd, "Fixation on CEC", ax_y, ax_u, "C10")
+    
+    # Normalized with Offline metrics, du_rms fixation, multiprocessing
+    kp = 0.47446807
+    ki = 0.15472707
+    kd = 7.83353195
+    run_case(kp, ki, kd, "Normal (median, IQR) du fixation", ax_y, ax_u, "C11")
     
     
     
