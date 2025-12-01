@@ -133,57 +133,43 @@ def sim_closed_loop_pid(kp, ki, kd,
                         t_final=5.0,
                         ref=1.0, disturb_time=20.0, disturb_value=5.0):
     """
-    Closed-loop simulation with discretized PID and discrete plant Gd.
+    Closed-loop simulation with discretized PID and discrete plant Gd,
+    using state-space stepping (same dynamics as control.step_response(Gd)).
     """
+
     pid = PID(kp, ki, kd, N, Ts, u_min, u_max, kb_aw, der_on_meas=True)
 
-    n_steps = int(t_final / Ts) + 1
-    t = np.linspace(0.0, t_final, n_steps)
+    n_steps = int(t_final / Ts)
+    t = np.arange(n_steps + 1) * Ts
 
-    u = np.zeros(n_steps)
-    y = np.zeros(n_steps)
+    # constant reference array
+    r = np.full_like(t, ref, dtype=float)
 
-    num, den = ctl.tfdata(Gd)
-    num = np.squeeze(num)
-    den = np.squeeze(den)
+    # state-space from Gd
+    Ad, Bd, Cd, Dd = ctl.ssdata(ctl.ss(Gd))
+    Ad = np.asarray(Ad)
+    Bd = np.asarray(Bd).reshape(-1)
+    Cd = np.asarray(Cd)
+    Dd = np.asarray(Dd).reshape(-1)
 
-    if den[0] != 1.0:
-        num = num / den[0]
-        den = den / den[0]
-
-    nb = len(num) - 1
-    na = len(den) - 1
+    x = np.zeros(Ad.shape[0])
+    y = np.zeros_like(t)
+    u = np.zeros_like(t)
 
     for k in range(n_steps):
-        # Disturbance at output
-        if disturb_time is not None and t[k] >= disturb_time:
-            measured = y[k] + disturb_value
-        else:
-            measured = y[k]
-
-        u[k] = pid.step(ref,
-                        measured if k < len(y) else y[-1])
         
-        #
-        u[k] = 1.0
-        #
+        y_meas = y[k]
+        if disturb_time is not None and t[k] >= disturb_time:
+            y_meas = y_meas + disturb_value
 
-        if k < n_steps - 1:
-            y_next = 0.0
+   
+        u[k] = pid.step(r[k], y_meas)
 
-            for i in range(1, na + 1):
-                idx_y = k + 1 - i
-                if idx_y >= 0:
-                    y_next -= den[i] * y[idx_y]
+        # Plant update: x_{k+1} = A x_k + B u_k
+        x = Ad @ x + Bd * u[k]
 
-            for j in range(0, nb + 1):
-                idx_u = k + 1 - j
-                if idx_u >= 0:
-                    y_next += num[j] * u[idx_u]
-
-            y[k + 1] = y_next
-            
-            
+        # Output: y_{k+1} = C x_{k+1} + D u_k
+        y[k+1] = (Cd @ x + Dd * u[k]).item()
 
     return t, y, u
 
@@ -229,8 +215,8 @@ def pid_cost_custom_with_Gd(x,
                             u_min, u_max, kb_aw,
                             t_final=5.0,
                             ref=1.0,
-                            w_sse=0.5,
-                            w_os=0.5,
+                            w_sse=0.7,
+                            w_os=0.7,
                             w_ts_tr=0.45,
                             w_rvg=0.35,
                             w_odj=0.35,
@@ -248,10 +234,10 @@ def pid_cost_custom_with_Gd(x,
     # ==================================================
     # J1 - SSE - Steady State Error
     # ==================================================
-    SSE_target = 0.01 * ref       # ±1% of step
-    SSE_max =  0.2* ref           # ±4% of step
+    SSE_target = 0.0 * ref       
+    SSE_max =  0.05* ref           
 
-    # Nominal response
+    # Nominal response, used in other costs too
     t_nom, y_nom, u_nom = sim_closed_loop_pid(
         kp, ki, kd,
         N, Ts,
@@ -273,7 +259,7 @@ def pid_cost_custom_with_Gd(x,
     # ==================================================
     # J2 - OS - Overshoot
     # ==================================================
-    OS_target = 1.0   # %
+    OS_target = 0.0   # %
     OS_max = 5.0     # %
 
     if OS_nom <= OS_target:
@@ -286,8 +272,8 @@ def pid_cost_custom_with_Gd(x,
     # J3 - Ts - Tr - Speed
     # ==================================================
     TsTr_nom = max(0.0, Ts__nom - Tr_nom)
-    TsTr_target = 1.0
-    TsTr_max = 5.0 
+    TsTr_target = 3.0
+    TsTr_max = 10.0 
 
     if TsTr_nom <= TsTr_target:
         j3 = 0.0
@@ -345,8 +331,8 @@ def pid_cost_custom_with_Gd(x,
 
     RVG_raw = w_d_sse * dSSE + w_d_os * dOS + w_d_ts * dTsTr
 
-    RVG_target = 0.0
-    RVG_max = 1.0
+    RVG_target = 1.0 
+    RVG_max = 5.0
 
     if RVG_raw <= RVG_target:
         j4 = 0.0
@@ -554,7 +540,7 @@ def main(args):
     Gc = G0 * H_delay
     Gd = ctl.c2d(Gc, Ts, method='tustin')
 
-    setpoint = 50.0
+    setpoint = 33.33 # Max speed in most European conntries
 
 
     def objective_pid(x):
