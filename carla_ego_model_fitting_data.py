@@ -174,7 +174,8 @@ def main(args, img_queue, char_queue, img_lock):
 
     teleport_time = int(5.0 / dt)  # interval in steps
     # For doing controlled tests (no random throttle)
-    throttle_vals = [1.0, 0.0, 0.75, 0.0, 0.5, 0.0, 0.25, 0.0]
+    # throttle_vals = [1.0, 0.0, 0.75, 0.0, 0.5, 0.0, 0.25, 0.0]
+    throttle_vals = [0.0, 1.0, 0.0]
     idx = 0
     
     try:
