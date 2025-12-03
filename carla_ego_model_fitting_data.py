@@ -76,7 +76,8 @@ def main(args, img_queue, char_queue, img_lock):
     original_settings = world.get_settings()
     settings = world.get_settings()
     settings.synchronous_mode = True  
-    settings.fixed_delta_seconds = 0.01 # I don't know if it's important, but should match the sampling
+    settings.fixed_delta_seconds = 0.01 # I don't know if it's important right now, 
+                                        # but should match the sampling
                                         # rate of the PID on the STM32
     settings.no_rendering_mode = False  # Camera feed is prefered, although not needed
     world.apply_settings(settings)
