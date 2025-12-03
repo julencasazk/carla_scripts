@@ -29,6 +29,20 @@ import multiprocessing as mp
 
 from PID import PID  # your existing PID implementation
 
+JSON_FILE = "metric_scales_kpkikd.json"
+# ---------------------------------------------------------------------------
+# Helper for multiprocessing workers
+# ---------------------------------------------------------------------------
+
+def _pso_worker(args):
+    """
+    Helper for multiprocessing.Pool.map.
+
+    args = (x, objective, objective_args)
+    """
+    x, objective, objective_args = args
+    return objective(x, *objective_args)
+
 
 # ---------------------------------------------------------------------------
 # PSO implementation using scalar cost J
@@ -36,19 +50,23 @@ from PID import PID  # your existing PID implementation
 
 def pso(objective,
         bounds,
-        num_particles=30,
-        max_it=50,
-        w=0.7,
-        c1=1.5,
-        c2=1.5,
+        num_particles=50,
+        max_it=100,
+        w=1.3,
+        c1=2.1,
+        c2=2.1,
         seed=None,
         verbose=True,
         log_path=None,
-        num_workers=1):
+        num_workers=1,
+        objective_args=None):
     """Standard PSO minimizing scalar J(x), with optional multiprocessing."""
 
     if seed is not None:
         np.random.seed(seed)
+
+    if objective_args is None:
+        objective_args = ()
 
     dim = len(bounds)
     bounds_min = np.array([b[0] for b in bounds], dtype=float)
@@ -72,8 +90,11 @@ def pso(objective,
 
     def eval_particles(particles_batch):
         if pool is None:
-            return [objective(x) for x in particles_batch]
-        return pool.map(objective, particles_batch)
+            # single-process
+            return [objective(x, *objective_args) for x in particles_batch]
+        # multi-process: pack each particle with objective + args
+        jobs = [(x, objective, objective_args) for x in particles_batch]
+        return pool.map(_pso_worker, jobs)
 
     try:
         # initial evaluation
@@ -389,7 +410,7 @@ def compute_metric_scales(Gd,
                           bounds,
                           num_samples=300,
                           seed=42,
-                          out_path="metric_scales.json"):
+                          out_path=JSON_FILE):
     """Randomly sample PIDs in bounds, compute metrics, derive median+IQR scales."""
     rng = np.random.default_rng(seed)
 
@@ -458,7 +479,7 @@ def compute_metric_scales(Gd,
     return scales
 
 
-def load_metric_scales(path="metric_scales.json"):
+def load_metric_scales(path=JSON_FILE):
     """Load metric scales from JSON, with safe defaults if missing."""
     default = {
         "SSE": 1.0,
@@ -528,6 +549,35 @@ def pid_cost_normalized(x,
 
 
 # ---------------------------------------------------------------------------
+# Top-level objective for multiprocessing
+# ---------------------------------------------------------------------------
+
+def objective_pid_global(x,
+                         Gd,
+                         N_filt,
+                         Ts,
+                         u_min,
+                         u_max,
+                         kb_aw,
+                         T_sim,
+                         setpoint,
+                         scales,
+                         weights=None):
+    """
+    Top-level objective for multiprocessing.
+    x = [kp, ki, kd]
+    """
+    return pid_cost_normalized(
+        x, Gd,
+        N=N_filt, Ts=Ts,
+        u_min=u_min, u_max=u_max, kb_aw=kb_aw,
+        t_final=T_sim, ref=setpoint,
+        scales=scales,
+        weights=weights,
+    )
+
+
+# ---------------------------------------------------------------------------
 # main
 # ---------------------------------------------------------------------------
 
@@ -569,39 +619,30 @@ def main(args):
             bounds=bounds,
             num_samples=args.scale_samples,
             seed=args.seed if args.seed != 0 else 42,
-            out_path="metric_scales.json",
+            out_path=JSON_FILE,
         )
         return
 
     # Normal PSO run: load scales
-    scales = load_metric_scales("metric_scales.json")
-
-    def objective_pid(x):
-        return pid_cost_normalized(
-            x, Gd,
-            N=N_filt, Ts=Ts,
-            u_min=u_min, u_max=u_max, kb_aw=kb_aw,
-            t_final=T_sim, ref=setpoint,
-            scales=scales,
-            weights=None,
-        )
+    scales = load_metric_scales(JSON_FILE)
 
     seed = args.seed
     if (seed is None) or (seed == 0):
         seed = np.random.randint(0, 10000)
 
     best_x, best_J, history = pso(
-        objective_pid,
+        objective_pid_global,
         bounds,
         num_particles=50,
-        max_it=100,
-        w=0.7,
-        c1=1.5,
-        c2=1.5,
+        max_it=300,
+        w=1.3,
+        c1=2.1,
+        c2=2.1,
         seed=seed,
         verbose=args.v,
         log_path=json_file,
         num_workers=args.workers,
+        objective_args=(Gd, N_filt, Ts, u_min, u_max, kb_aw, T_sim, setpoint, scales, None),
     )
 
     print(f"Best X: {best_x}")
