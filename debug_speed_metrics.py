@@ -4,19 +4,19 @@ import control as ctl
 import matplotlib.pyplot as plt
 from pso_pid_tuning import sim_closed_loop_pid, step_metrics
 
-def run_case(kp, ki, kd, label, ax_y, ax_u, color):
+def run_case(kp, ki, kd, label, ax_y, ax_u, color, N_filt=20.0, kb_aw=1.0):
     Ts = 0.01
     Td = 0.15
     s = ctl.TransferFunction.s
     G0 = (12.68) / (s**2 + 1.076*s + 0.2744)
     num_delay, den_delay = ctl.pade(Td, 1)
     H_delay = ctl.tf(num_delay, den_delay)
-    Gc = 1.4 * G0 * H_delay
+    Gc = G0 * H_delay
     Gd = ctl.c2d(Gc, Ts, method='tustin')
+    
+    print(Gd)
 
-    N_filt = 20.0
     u_min, u_max = 0.0, 1.0          # throttle in [0,1]
-    kb_aw = 1.0
     T_sim = 80.0
     ref = 33.33
 
@@ -109,12 +109,50 @@ def main():
     ki = 0.29906212
     kd = 8.73205437
     run_case(kp, ki, kd, "Fixation on CEC", ax_y, ax_u, "C10")
-    
+   
+    ''' 
     # Normalized with Offline metrics, du_rms fixation, multiprocessing
     kp = 0.47446807
     ki = 0.15472707
     kd = 7.83353195
     run_case(kp, ki, kd, "Normal (median, IQR) du fixation", ax_y, ax_u, "C11")
+    '''
+    
+    # Multiprocessing normal Kp, Ki, Kd tuning, with _target = 0.
+    kp = 0.60988305
+    ki = 0.19988017
+    kd = 9.99136697
+    # seed 7077
+    run_case(kp, ki, kd, "Fixation on cec, multiprocessing, no targets", ax_y, ax_u, "C12")
+
+
+    # Multiprocessing with Kp Ki N and k anti windup 
+    '''
+    kp = 3.70359920e-01
+    ki = 1.09943679e-02
+    kd = 5.40267246e+00
+    N = 2.98547541e+01
+    kaw = 1.79594124e-01
+    run_case(kp, ki, kd, "NKaw", ax_y, ax_u, "C13", N, kaw)
+    '''
+
+    # Another try, but this time, with more "normal" weights
+    # This is the MOST AGGRESIVE but without Overshoot for NOW
+    kp = 0.77658553
+    ki = 0.84037437
+    kd = 10.0
+    N = 39.34907758
+    kaw = 1.0
+    run_case(kp, ki, kd, "N_Only", ax_y, ax_u, "C14", N, kaw)
+    
+    # ODJ changed from integral of the error^2 to the mean error^2. Seems to have yielded more reasonable response???
+    kp = 0.21008327
+    ki = 0.06662786
+    kd = 6.61821463
+    N  = 37.98325395
+    kaw = 1.0
+    run_case(kp, ki, kd, "Mean ODJ", ax_y, ax_u, "C15", N, kaw)
+   
     
     
     
