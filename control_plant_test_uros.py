@@ -9,6 +9,7 @@ import argparse
 import time
 from threading import Thread
 import sys
+from CarlaROSNode import CarlaROSNode
 
 class CarlaROSNode(Node):
     def __init__(self, args):
