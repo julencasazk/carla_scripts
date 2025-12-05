@@ -171,6 +171,8 @@ def pso(objective,
                         "u_rms": float(metrics["u_rms"]),
                         "du_rms": float(metrics["du_rms"]),
                         "sat_ratio": float(metrics["sat_ratio"]),
+                        "best_x": gbest_position.tolist(), 
+                        "best_cost": float(gbest_value)
                     })
 
                 history.append(gbest_value)
@@ -238,10 +240,16 @@ def sim_closed_loop_pid(kp, ki, kd,
     y = np.zeros_like(t, dtype=float)
     u = np.zeros_like(t, dtype=float)
 
+    # Gaussian measurement noise
+    meas_noise_std = 0.05
+
     for k in range(n_steps):
         y_meas = y[k]
         if disturb_time is not None and t[k] >= disturb_time:
             y_meas = y_meas + disturb_value
+
+        if meas_noise_std > 0:
+            y_meas += np.random.normal(0.0, meas_noise_std)
 
         u[k] = pid.step(r[k], y_meas)
 
@@ -531,14 +539,14 @@ def pid_cost_normalized(x,
 
     if weights is None:
         weights = {
-            "SSE": 2.0,
-            "OS": 2.0,
-            "TsTr": 2.0,
-            "RVG": 0.2,
-            "ODJ": 0.3,
-            "u_rms": 0.1,
-            "du_rms": 0.5,
-            "sat_ratio": 0.3,
+            "SSE":    3.0,
+            "OS":     3.0,
+            "TsTr":   4.0,
+            "RVG":    0.1,
+            "ODJ":    0.2,
+            "u_rms":  0.5,
+            "du_rms": 1.0,
+            "sat_ratio": 1.0,
         }
 
     J = 0.0
@@ -591,23 +599,29 @@ def main(args):
     u_max = 1.0
     T_sim = 80.0
 
-    # Plant with delay
-    Td = 0.15
     s = ctl.TransferFunction.s
+    '''
+    # Plant fitted with maximum speed 
+    Td = 0.15
     G0 = 12.68 / (s**2 + 1.076*s + 0.2744)
     num_delay, den_delay = ctl.pade(Td, 1)
     H_delay = ctl.tf(num_delay, den_delay)
     Gc = G0 * H_delay
     Gd = ctl.c2d(Gc, Ts, method="tustin")
-
-    setpoint = 33.33
+    '''
+    
+    # Plant fitted with "reasonable" speeds
+    G0 = (8.7129*s + 0.05263) / (s**2 + 0.1953*s + 0.0001874) 
+    Gd = ctl.c2d(G0, Ts, method='tustin')
+    
+    setpoint = 20.00
 
     # PID search bounds: [kp, ki, kd, N]
     bounds = [
         (0.0, 2.0),   # Kp
         (0.0, 1.0),   # Ki
-        (0.0, 10.0),  # Kd
-        (5.0, 40.0),  # N
+        (0.0, 1.5),  # Kd
+        (5.0, 15.0),  # N
     ]
 
     # Optional: offline scales computation mode
@@ -649,9 +663,47 @@ def main(args):
     print(f"Best J: {best_J}")
     print(f"Seed:   {seed}")
 
+    # Plot best cost history
+    plt.figure()
     plt.plot(history)
     plt.xlabel("iteration")
     plt.ylabel("best J")
+    plt.title("Best cost history")
+    plt.grid(True)
+
+    # --- New: simulate and plot step response for best controller ---
+    kp, ki, kd, N = best_x
+    kb_aw = FIXED_KAW
+
+    t_best, y_best, u_best = sim_closed_loop_pid(
+        kp, ki, kd,
+        N, Ts,
+        Gd,
+        u_min, u_max, kb_aw,
+        t_final=T_sim, ref=setpoint,
+        disturb_time=None,
+        disturb_value=0.0
+    )
+
+    # Output vs reference
+    plt.figure()
+    plt.plot(t_best, y_best, label="Output y(t)")
+    plt.plot(t_best, np.full_like(t_best, setpoint), "k--", label="Reference")
+    plt.xlabel("time [s]")
+    plt.ylabel("speed")
+    plt.title("Step response of best PID")
+    plt.grid(True)
+    plt.legend()
+
+    # Control signal
+    plt.figure()
+    plt.plot(t_best, u_best, label="u(t)")
+    plt.xlabel("time [s]")
+    plt.ylabel("control signal u")
+    plt.title("Control signal of best PID")
+    plt.grid(True)
+    plt.legend()
+
     plt.show()
 
     
