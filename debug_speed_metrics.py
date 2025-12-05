@@ -8,11 +8,16 @@ def run_case(kp, ki, kd, label, ax_y, ax_u, color, N_filt=20.0, kb_aw=1.0):
     Ts = 0.01
     Td = 0.15
     s = ctl.TransferFunction.s
+    '''
     G0 = (12.68) / (s**2 + 1.076*s + 0.2744)
     num_delay, den_delay = ctl.pade(Td, 1)
     H_delay = ctl.tf(num_delay, den_delay)
     Gc = G0 * H_delay
     Gd = ctl.c2d(Gc, Ts, method='tustin')
+    '''
+
+    G0 = (8.7129*s + 0.05263) / (s**2 + 0.1953*s + 0.0001874) 
+    Gd = ctl.c2d(G0, Ts, method='tustin')
     
     print(Gd)
 
@@ -64,10 +69,9 @@ def main():
 
     run_case(kp, ki, kd, "Aggresive", ax_y, ax_u, "C3")
     
-
+    '''
     # New test with the simulation method fixed,
     # should be truer to the real plant
-    # THESE ARE THE BEST VALUES FOR NOW
     kp = 0.21857731
     ki = 0.05122361
     kd = 5.0
@@ -78,7 +82,9 @@ def main():
     ki = 0.10109199
     kd = 4.16309923
     #run_case(kp, ki, kd, "Ranked cost scaling", ax_y, ax_u, "C5")
-
+    '''
+    
+    '''
     # Normalized cost scaling, scaling with max and min each iteration
     kp = 0.78735842
     ki = 0.48564073
@@ -91,12 +97,14 @@ def main():
     ki = 0.49750068
     kp = 5.31105199
     #run_case(kp, ki, kd, "Normalized scaling 2", ax_y, ax_u, "C7")
-    
+    '''
+    '''
     # Normal PID tuning, but with no target theshold, minimum 0.0
     kp = 0.60132401
     ki = 0.25121954
     kd = 7.73220397
     run_case(kp, ki, kd, "Normal PID without _target", ax_y, ax_u, "C8")
+    '''
     
     # Normalized with offline metrics (median InterQuartile Range), new method in pid_tuning_offline_normalize.py
     kp = 0.60868111
@@ -104,12 +112,6 @@ def main():
     kd = 10.0
     #run_case(kp, ki, kd, "Offline normalization (median IQR)", ax_y, ax_u, "C9")
 
-    # Another manually bound test (pso_pid_tuning.py)
-    kp = 0.70008584
-    ki = 0.29906212
-    kd = 8.73205437
-    run_case(kp, ki, kd, "Fixation on CEC", ax_y, ax_u, "C10")
-   
     ''' 
     # Normalized with Offline metrics, du_rms fixation, multiprocessing
     kp = 0.47446807
@@ -123,7 +125,7 @@ def main():
     ki = 0.19988017
     kd = 9.99136697
     # seed 7077
-    run_case(kp, ki, kd, "Fixation on cec, multiprocessing, no targets", ax_y, ax_u, "C12")
+    run_case(kp, ki, kd, "Fixation on CEC", ax_y, ax_u, "C12")
 
 
     # Multiprocessing with Kp Ki N and k anti windup 
@@ -143,7 +145,7 @@ def main():
     kd = 10.0
     N = 39.34907758
     kaw = 1.0
-    run_case(kp, ki, kd, "N_Only", ax_y, ax_u, "C14", N, kaw)
+    run_case(kp, ki, kd, "Including N on PSO", ax_y, ax_u, "C14", N, kaw)
     
     # ODJ changed from integral of the error^2 to the mean error^2. Seems to have yielded more reasonable response???
     kp = 0.21008327
@@ -151,11 +153,26 @@ def main():
     kd = 6.61821463
     N  = 37.98325395
     kaw = 1.0
-    run_case(kp, ki, kd, "Mean ODJ", ax_y, ax_u, "C15", N, kaw)
-   
+    run_case(kp, ki, kd, "Mean ODJ instead of integral", ax_y, ax_u, "C15", N, kaw)
     
+    kp =  0.55856216
+    ki = 0.1824219
+    kd = 6.71382146
+    N = 14.87180254
+    kaw = 1.0
+    run_case(kp, ki, kd, "Anothaone", ax_y, ax_u, "C16", N, kaw)
     
-    
+    kp =  0.73728434
+    ki =  0.7365131
+    kd =  6.94588313
+    N = 29.16005392 
+    run_case(kp, ki, kd, "Aggresive2", ax_y, ax_u, "C17", N, kaw)
+
+    kp = 2.59397071e-01
+    ki = 1.27381733e-01
+    kd = 6.21160744e-03
+    N = 15.0
+    run_case(kp, ki, kd, "New model, same weights", ax_y, ax_u, "C18", N, kaw)
 
     ax_y.set_ylabel("y [m/s]")
     ax_y.set_title("Closed-loop step responses (same sim as cost)")
