@@ -3,7 +3,8 @@ import matplotlib.pyplot as plt
 import control as ctl
 import rclpy
 from rclpy.node import Node
-from std_msgs.msg import Float32
+from std_msgs.msg import Float64
+from pid_message.msg import PID
 import argparse
 import time
 from threading import Thread
@@ -18,15 +19,11 @@ class CarlaROSNode(Node):
         qos_params = rclpy.qos.QoSProfile(depth=1, reliability=rclpy.qos.QoSReliabilityPolicy.RELIABLE)
         qos_stream = rclpy.qos.QoSProfile(depth=10, reliability=rclpy.qos.QoSReliabilityPolicy.BEST_EFFORT)
         # Publishers
-        self._pv_pub  = self.create_publisher(Float32, 'pv',  qos_stream)
-        self._kp_pub  = self.create_publisher(Float32, 'kp',  qos_params)
-        self._ki_pub  = self.create_publisher(Float32, 'ki',  qos_params)
-        self._kd_pub  = self.create_publisher(Float32, 'kd',  qos_params)
-        self._N_pub   = self.create_publisher(Float32, 'N',   qos_params)
-        self._kaw_pub = self.create_publisher(Float32, 'kaw', qos_params)
+        self._pv_pub  = self.create_publisher(Float64, 'pv',  qos_stream)
+        self._pid_param_pub = self.create_publisher(PID, 'pid_params', qos_params)
         # Subscribers
-        self._u_sub = self.create_subscription(Float32, 'u', self.u_cb, qos_stream)
-        self._r_sub = self.create_subscription(Float32, 'r', self.r_cb, qos_params)
+        self._u_sub = self.create_subscription(Float64, 'u', self.u_cb, qos_stream)
+        self._r_sub = self.create_subscription(Float64, 'r', self.r_cb, qos_params)
         # Internal signals
         self._r_val = 0.0
         self._u_val = 0.0
@@ -40,13 +37,9 @@ class CarlaROSNode(Node):
         # Discrete plant (same as pure-python simulation: state-space form)
         # ------------------------------------------------------------------
         Ts = self.Ts
-        Td = 0.15
         s = ctl.TransferFunction.s
-        G0 = 12.68 / (s**2 + 1.076*s + 0.2744)
-        num_delay, den_delay = ctl.pade(Td, 1)
-        H_delay = ctl.tf(num_delay, den_delay)
-        Gc = G0 * H_delay
-        Gd = ctl.c2d(Gc, Ts, method='tustin')
+        G0 = (8.7129*s + 0.05263) / (s**2 + 0.1953*s + 0.0001874) 
+        Gd = ctl.c2d(G0, Ts, method='tustin')
 
         # Convert to discrete state-space (same as in control_plant_test_pure_python.py)
         Ad, Bd, Cd, Dd = ctl.ssdata(ctl.ss(Gd))
@@ -80,39 +73,34 @@ class CarlaROSNode(Node):
         # Publish PID params once
         self.publish_params()
         # High-rate plant timer (lightweight)
-        self.plant_timer = self.create_timer(self.Ts, self.step_callback)
+        self.plant_timer = self.create_timer(0.01, self.step_callback)
         # Plot handled externally in main loop thread
 
     def publish_params(self):
-        msgs = {
-            'kp': self._args.kp,
-            'ki': self._args.ki,
-            'kd': self._args.kd,
-            'N':  self._args.N,
-            'kaw': self._args.kaw
-        }
-        for topic, value in msgs.items():
-            m = Float32()
-            m.data = float(value)
-            getattr(self, f'_{topic}_pub').publish(m)
-        self.get_logger().info(f"PID params published: {msgs}")
+        m = PID()
+        m.kp = self._args.kp
+        m.ki = self._args.ki
+        m.kd = self._args.kd
+        m.n  = self._args.N
+        self._pid_param_pub.publish(m)
+        self.get_logger().info(f"PID params published: {m}")
 
-    def u_cb(self, msg: Float32):
+    def u_cb(self, msg: Float64):
         self._u_val = float(msg.data)
 
-    def r_cb(self, msg: Float32):
+    def r_cb(self, msg: Float64):
         self._r_val = float(msg.data)
 
     def step_callback(self):
         # Current control from microcontroller PID
         u_curr = self._u_val
 
-        # State-space update (same as pure-python sim)
+        # State-space update 
         self.x = self.Ad @ self.x + self.Bd * u_curr
         y_curr = (self.Cd @ self.x + self.Dd * u_curr).item()
 
         self._y_val = y_curr
-        pv_msg = Float32()
+        pv_msg = Float64()
         pv_msg.data = float(y_curr)
         self._pv_pub.publish(pv_msg)
 
@@ -171,7 +159,6 @@ def main():
     parser.add_argument('--ki', type=float, default=0.15472707)
     parser.add_argument('--kd', type=float, default=7.83353195)
     parser.add_argument('--N', type=float, default=20.0)
-    parser.add_argument('--kaw', type=float, default=1.0)
     parser.add_argument('--Ts', type=float, default=0.01, help="Sampling period (s)")
     parser.add_argument('--plot-period', type=float, default=0.1, help="Plot update period (s)")
     parser.add_argument('--no-plot', action='store_true', help="Disable live plotting")
