@@ -1,20 +1,48 @@
+# filepath: /home/jcazk/carla_scripts/plot_csv.py
+#!/usr/bin/env python3
+# filepath: /home/jcazk/carla_scripts/plot_csv.py
 import argparse
 import sys
 from pathlib import Path
+
 import pandas as pd
-
-#!/usr/bin/env python3
-
 import matplotlib.pyplot as plt
 
 
 def parse_args():
     p = argparse.ArgumentParser(
-        description="Plot throttle and speed vs time from a CSV (columns: time_s, throttle, speed_m_s)."
+        description=(
+            "Plot one or more CSV columns vs a reference column.\n"
+            "Example: plot_csv.py data.csv --ref time_s -p throttle speed_m_s"
+        )
     )
     p.add_argument("csv", type=Path, help="Input CSV file.")
-    p.add_argument("-o", "--out", type=Path, help="Optional output image path (e.g. plot.png).")
-    p.add_argument("--title", default="Throttle and Speed vs Time", help="Figure title.")
+    p.add_argument(
+        "-o",
+        "--out",
+        type=Path,
+        help="Optional output image path (e.g. plot.png).",
+    )
+    p.add_argument(
+        "--ref",
+        type=str,
+        default="time_s",
+        help="X-axis column name (default: time_s)",
+    )
+    p.add_argument(
+        "-p",
+        "--plot",
+        metavar="FIELD",
+        nargs="+",  # one or more values
+        required=True,
+        help="Columns to plot on Y-axis (space-separated list)",
+    )
+    p.add_argument(
+        "--title",
+        type=str,
+        default=None,
+        help="Optional overall figure title",
+    )
     return p.parse_args()
 
 
@@ -37,34 +65,44 @@ def main():
         print(f"Error reading CSV: {e}", file=sys.stderr)
         sys.exit(1)
 
+    required_cols = [args.ref] + list(args.plot)
     try:
-        validate_columns(df, ["time_s", "throttle", "speed_m_s"])
+        validate_columns(df, required_cols)
     except ValueError as e:
         print(f"Error: {e}", file=sys.stderr)
         sys.exit(1)
 
-    # Drop rows with NaNs in required columns
-    df = df.dropna(subset=["time_s", "throttle", "speed_m_s"])
+    df = df.dropna(subset=required_cols)
+    x = df[args.ref]
 
-    fig, ax1 = plt.subplots(figsize=(10, 5))
-    ax2 = ax1.twinx()
+    # color sequence: orange, blue, red, green, purple, brown, pink, gray, olive, cyan
+    colors = ["orange", "blue", "red", "green", "purple", "brown", "pink", "gray", "olive", "cyan"]
 
-    ax1.plot(df["time_s"], df["throttle"], color="tab:blue", label="Throttle")
-    ax2.plot(df["time_s"], df["speed_m_s"], color="tab:red", label="Speed")
+    n_plots = len(args.plot)
+    # one tall figure, height grows with number of plots
+    fig, axes = plt.subplots(
+        n_plots,
+        1,
+        figsize=(10, 3 * n_plots),
+        sharex=True,
+    )
 
-    ax1.set_xlabel("Time (s)")
-    ax1.set_ylabel("Throttle (0-1)", color="tab:blue")
-    ax2.set_ylabel("Speed (m/s)", color="tab:red")
+    # if only one subplot, axes is not a list; make it iterable
+    if n_plots == 1:
+        axes = [axes]
 
-    ax1.tick_params(axis="y", labelcolor="tab:blue")
-    ax2.tick_params(axis="y", labelcolor="tab:red")
+    for i, (col, ax) in enumerate(zip(args.plot, axes)):
+        color = colors[i % len(colors)]
+        ax.plot(x, df[col], color=color)
+        ax.set_ylabel(col)
 
-    fig.suptitle(args.title)
+        ax.grid(True, linestyle="--", alpha=0.4)
 
-    # Combined legend
-    lines = ax1.get_lines() + ax2.get_lines()
-    labels = [l.get_label() for l in lines]
-    ax1.legend(lines, labels, loc="upper right")
+    # common x-label on the last subplot
+    axes[-1].set_xlabel(args.ref)
+
+    if args.title:
+        fig.suptitle(args.title, y=0.99)
 
     fig.tight_layout()
 
