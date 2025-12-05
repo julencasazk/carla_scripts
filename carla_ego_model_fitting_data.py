@@ -139,7 +139,7 @@ def main(args, img_queue, char_queue, img_lock):
 
     # Step test definition
     dt = settings.fixed_delta_seconds
-    total_time = 360.0 
+    total_time = 3600.0 # Very long time, enough to input all throttle setpoints 
     total_steps = int(total_time / dt)
     '''
     min_sec = 10
@@ -176,8 +176,11 @@ def main(args, img_queue, char_queue, img_lock):
     teleport_time = int(5.0 / dt)  # interval in steps
     # For doing controlled tests (no random throttle)
     # throttle_vals = [1.0, 0.0, 0.75, 0.0, 0.5, 0.0, 0.25, 0.0]
-    throttle_vals = [0.0, 1.0, 0.0]
+    throttle_vals = [0.0, 0.80, 0.0, 0.75, 0.0, 0.7, 0.0, 0.65, 0.0, 0.60, 0.0, 0.55, 0.0, 0.5,
+                     0.0, 0.45, 0.0, 0.40, 0.0, 0.35, 0.0, 0.3, 0.0, 0.25, 0.0, 0.2, 0.0, 0.15, 0.0,
+                     0.10, 0.0, 0.05, 0.0]
     idx = 0
+    finished = False
     
     try:
         # Sim time counter 
@@ -199,7 +202,8 @@ def main(args, img_queue, char_queue, img_lock):
         vehicle.apply_control(carla.VehicleControl(throttle=0.0, brake=0.0))
 
         # Synchronous loop 
-        while sim_time < total_time:
+        #while sim_time < total_time:
+        while not finished:
             # Update a single simulation step 
             world.tick()
             snapshot = world.get_snapshot()
@@ -207,6 +211,10 @@ def main(args, img_queue, char_queue, img_lock):
             if start_timestamp is None:
                 start_timestamp = t
             sim_time = t - start_timestamp
+            
+            # If on last step, do the step and finish
+            if sim_time >= total_time:
+                finished = True
 
 
             brake_cmd = 0.0  
@@ -229,7 +237,8 @@ def main(args, img_queue, char_queue, img_lock):
                 if abs(speed - last_change_speed) <= band:
                     # throttle_cmd = float(np.random.rand())
                     throttle_cmd = throttle_vals[idx]
-                    
+                    if idx == (len(throttle_vals) - 1):
+                        finished = True
                     idx = (idx+1) % len(throttle_vals)
                     print(f"Throttle change to {throttle_cmd:.3f} at t={sim_time:.2f}s "
                           f"(speed: d{speed:.2f} m/s)")
