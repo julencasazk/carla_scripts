@@ -1,6 +1,6 @@
 
 class PID:
-    def __init__(self, kp, ki, kd, N, Ts, u_min, u_max, kb_aw, der_on_meas=False):
+    def __init__(self, kp, ki, kd, N, Ts, u_min, u_max, kb_aw, der_on_meas=False, prop_on_meas=False):
         self.kp = kp
         self.ki = ki
         self.kd = kd
@@ -10,6 +10,7 @@ class PID:
         self.max_output = u_max
         self.kb_aw = kb_aw
         self.der_on_meas = der_on_meas
+        self.prop_on_meas = prop_on_meas
 
         self.i_state = 0.0
         self.e_prev = 0.0
@@ -33,13 +34,16 @@ class PID:
     def step(self, setpoint, measurement):
         e = setpoint - measurement
 
-        u_p = self.kp * e
 
         
-        w = e if not self.der_on_meas else (-measurement)
-        u_d = self.k_u * self.d_prev + self.k_w * w - self.k_w * self.w_prev
+        w_d = (-1 * measurement) if self.der_on_meas else (e)
+        w_p = (-1 * measurement) if self.prop_on_meas else (e)
+
+        u_p = self.kp * w_p
+        
+        u_d = self.k_u * self.d_prev + self.k_w * w_d - self.k_w * self.w_prev
         self.d_prev = u_d
-        self.w_prev = w
+        self.w_prev = w_d
 
         dI_base = self.ki * self.ts * e  # backward Euler
         u_i = self.i_state + dI_base
