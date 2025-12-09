@@ -1,5 +1,3 @@
-
-
 import carla
 import numpy as np
 import cv2
@@ -16,7 +14,7 @@ from PID import PID
 import rclpy
 from rclpy.node import Node
 from std_msgs.msg import Float64
-from pid_message.msg import PID
+from pid_message.msg import PID as PIDMsg
 from threading import Thread
 
 class CarlaROSPIDNode(Node):
@@ -29,7 +27,7 @@ class CarlaROSPIDNode(Node):
         qos_stream = rclpy.qos.QoSProfile(depth=10, reliability=rclpy.qos.QoSReliabilityPolicy.BEST_EFFORT)
         # Publishers
         self._pv_pub  = self.create_publisher(Float64, 'pv',  qos_stream)
-        self._pid_param_pub = self.create_publisher(PID, 'pid_params', qos_params)
+        self._pid_param_pub = self.create_publisher(PIDMsg, 'pid_params', qos_params)
         self._r_pub = self.create_publisher(Float64, 'r', qos_params)
 
         # Subscribers
@@ -43,7 +41,7 @@ class CarlaROSPIDNode(Node):
         self.publish_params()
 
     def publish_params(self):
-        m = PID()
+        m = PIDMsg()
         m.kp = self._args.kp
         m.ki = self._args.ki
         m.kd = self._args.kd
@@ -53,6 +51,39 @@ class CarlaROSPIDNode(Node):
 
     def u_cb(self, msg: Float64):
         self._u_val = float(msg.data)
+
+
+#####################################
+# Smooth setpoint generator
+#####################################
+def smooth_setpoint(t: float) -> float:
+    """
+    Smooth longitudinal speed setpoint [m/s] as a function of sim time t [s].
+
+    Example profile:
+      - 0 -> 15 m/s, transition centered at 10 s
+      - 15 -> 25 m/s, transition centered at 30 s
+      - 25 ->  5 m/s, transition centered at 50 s
+
+    All transitions are sigmoids, so r(t) is smooth (C^1).
+    Tune targets / centers / widths as desired.
+    """
+    # Start at 0 m/s
+    r = 0.0
+
+    # (target_speed_m_s, center_time_s, width_s)
+    transitions = [
+        (5.0, 10.0,  3.0),
+    ]
+
+    for target, center, width in transitions:
+        # logistic sigmoid
+        alpha = 1.0 / (1.0 + math.exp(-(t - center) / width))
+        # blend previous value towards new target
+        r = r * (1.0 - alpha) + target * alpha
+
+    return r
+
 
 #####################################
 # Dashcam process 
@@ -92,6 +123,7 @@ def dashcam(args, img_queue, char_queue, img_lock):
         cv2.destroyAllWindows()
         print("Destroyed all windows")
 
+
 #####################################
 # Main CARLA process 
 #####################################
@@ -109,7 +141,7 @@ def main(args, img_queue, char_queue, img_lock):
     executor.add_node(node)
     exec_thread = Thread(target=executor.spin, daemon=True)
     exec_thread.start() 
-    print("Controller setup") # Might need to check if params are propely published
+    print("Controller setup")
 
     latest_frame = None
     frame_lock = threading.Lock()
@@ -133,15 +165,12 @@ def main(args, img_queue, char_queue, img_lock):
     original_settings = world.get_settings()
     settings = world.get_settings()
     settings.synchronous_mode = True  
-    settings.fixed_delta_seconds = 0.01 # I don't know if it's important right now, 
-                                        # but should match the sampling
-                                        # rate of the PID on the STM32
-    settings.no_rendering_mode = False  # Camera feed is prefered, although not needed
+    settings.fixed_delta_seconds = 0.01
+    settings.no_rendering_mode = False  # camera preferred, but not required
     world.apply_settings(settings)
-    print(f"Synchronous mode ON, dt = {0.01} s")
+    print(f"Synchronous mode ON, dt = {settings.fixed_delta_seconds} s")
 
     spawn_points = world.get_map().get_spawn_points()
-    
     spawn_point = spawn_points[54]
     spawn_point.location.z -= 0.3
     vehicle_bp = bp_library.find('vehicle.tesla.model3')
@@ -195,24 +224,15 @@ def main(args, img_queue, char_queue, img_lock):
     ])
     csv_file.flush()
 
-    # Step test definition
+    # Test definition
     dt = settings.fixed_delta_seconds
-    total_time = 3600.0 # Very long time, enough to input all throttle setpoints 
+    total_time = 3600.0  # long enough
     total_steps = int(total_time / dt)
-    print(f"Running step test: dt={dt}s, total_time={total_time}s")
+    print(f"Running smooth setpoint test: dt={dt}s, total_time={total_time}s")
     print(f"Logging to: {csv_filename}")
 
     teleport_time = int(5.0 / dt)  # interval in steps
-    # For doing controlled tests (no random throttle)
-    # Incremental tests: sp1 -> 0.0 -> sp2 -> 0.0 ...
-    # setpoints = [0.0, 5.0, 0.0, 10.0, 0.0, 15.0, 0.0, 20.0, 0.0, 25.0, 0.0, 30.0, 0.0]
-    # More random values
-    setpoints = [0.0, 33.00, 30.00, 24.00, 15.00, 17.00, 22.00, 4.00, 13.34, 0.00, 1.00, 2.00, 13.00, 0.00]
 
-    y = np.zeros_like(total_steps)
-    u = np.zeros_like(total_steps)
-
-    idx = 0
     finished = False
     
     try:
@@ -220,24 +240,12 @@ def main(args, img_queue, char_queue, img_lock):
         sim_time = 0.0
         start_timestamp = None
         step = 0
-        # Wait the car to stabilize before doing a setpoint
-        stable_step = 0        
-        prev_speed = 0.0
-
-        last_change_step = 0
-        last_change_speed = 0.0
-        throttle_cmd = 0.0
-        band = 0.2                      # stable band value of +- <band> m/s
-                                        # speed is stable if inside band for <min_wait_steps> steps 
-        min_wait_steps = int(5.0 / dt)  # secons between stability checks 
 
         # Vehicle reset 
         vehicle.apply_control(carla.VehicleControl(throttle=0.0, brake=0.0))
 
         # Synchronous loop 
-        #while sim_time < total_time:
         while not finished:
-            
             # Update a single simulation step 
             world.tick()
             snapshot = world.get_snapshot()
@@ -246,7 +254,7 @@ def main(args, img_queue, char_queue, img_lock):
                 start_timestamp = t
             sim_time = t - start_timestamp
             
-            # If on last step, do the step and finish
+            # Finish after total_time
             if sim_time >= total_time:
                 finished = True
 
@@ -254,44 +262,32 @@ def main(args, img_queue, char_queue, img_lock):
 
             vel = vehicle.get_velocity()
             accel = vehicle.get_acceleration()
-            # Teleport every 5 seconds to stay in flat segment 
-            # of highway continuously
+
+            # Teleport every 5 seconds to stay in a flat segment of highway
             if step > 0 and step % teleport_time == 0:
                 vehicle.set_transform(spawn_point)
                 print("Teleport!!")
             
             speed = math.sqrt(vel.x**2 + vel.y**2)
 
-            # Publish new PV
+            # PV from CARLA -> ROS
             throttle_cmd = node._u_val
             node._y_val = speed 
             pv_msg = Float64()
             pv_msg.data = float(speed)
             node._pv_pub.publish(pv_msg)
 
-            # Publish setpoints
-            node._r_val = setpoints[idx]
-            r_msg = Float64()
-            r_msg.data = float(setpoints[idx])
-            node._r_pub.publish(r_msg)
-        
-            
-            # Check if enough time has passed since last change
-            if (step - last_change_step) >= min_wait_steps:
-                # Has it entered the error band? 
-                if abs(speed - setpoints[idx]) <= band:
-                    # throttle_cmd = float(np.random.rand())
+            # Smooth setpoint as function of sim_time
+            sp = smooth_setpoint(sim_time)
 
-                    if idx == (len(setpoints) - 1):
-                        finished = True
-                    idx = (idx+1) % len(setpoints)
-                    print(f"Setpoint change to {setpoints[idx]:.3f} at t={sim_time:.2f}s "
-                          f"(speed: d{speed:.2f} m/s)")
-                last_change_step = step
-                last_change_speed = speed
+            # Publish setpoint to ROS
+            node._r_val = sp
+            r_msg = Float64()
+            r_msg.data = float(sp)
+            node._r_pub.publish(r_msg)
 
             print(f"Current throttle: {throttle_cmd:.3f}")
-            print(f"Current Setpoint: {setpoints[idx]:.3f}")
+            print(f"Current Setpoint: {sp:.3f}")
             print(f"Current speed: {speed:.3f}")
 
             control = carla.VehicleControl(
@@ -306,7 +302,7 @@ def main(args, img_queue, char_queue, img_lock):
             csv_writer.writerow([
                 f"{sim_time:.4f}",
                 f"{throttle_cmd:.4f}",
-                f"{setpoints[idx]:.4f}",
+                f"{sp:.4f}",
                 f"{brake_cmd:.4f}",
                 f"{speed:.4f}",
                 f"{accel.x:.4f}",
@@ -317,10 +313,9 @@ def main(args, img_queue, char_queue, img_lock):
             print(f"Step {step}/{total_steps}")
             print(f"Elapsed time: {sim_time}/{total_time}")
 
-            step = step + 1
-            
+            step += 1
 
-        print("Step test finished successfully.")
+        print("Smooth setpoint test finished successfully.")
 
         # Stop vehicle when test over
         vehicle.apply_control(carla.VehicleControl(throttle=0.0, brake=1.0))
@@ -333,17 +328,18 @@ def main(args, img_queue, char_queue, img_lock):
         print("Cleaning up actors...")
         try:
             cam.stop()
-        except:
+        except Exception:
             pass
 
         try:
             vehicle.destroy()
-        except:
+        except Exception:
             pass
 
         csv_file.close()
 
         print("Done cleanup.")
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="CARLA longitudinal identification test")
