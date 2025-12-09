@@ -68,7 +68,7 @@ def main(args, img_queue, char_queue, img_lock):
     kd = 6.21160744e-03
     N_d = 5.0
     kb_aw = 1.0
-    u_min, u_max = 0.0, 1.0   # throttle 0–1
+    u_min, u_max = -1.0, 1.0
 
 
     pid = PID(kp, ki, kd, N_d, Ts, u_min, u_max, kb_aw, der_on_meas=True)
@@ -224,7 +224,14 @@ def main(args, img_queue, char_queue, img_lock):
             
             speed = math.sqrt(vel.x**2 + vel.y**2)
 
-            throttle_cmd = pid.step(setpoints[idx], speed)
+            u = pid.step(setpoints[idx], speed)
+
+            if u > 0.0:
+                throttle_cmd = u
+                brake_cmd = 0.0
+            else:
+                throttle_cmd = 0.0
+                brake_cmd = abs(u)
 
             # Check if enough time has passed since last change
             if (step - last_change_step) >= min_wait_steps:
@@ -240,9 +247,15 @@ def main(args, img_queue, char_queue, img_lock):
                 last_change_step = step
                 last_change_speed = speed
 
+            loc = vehicle.get_location()
             print(f"Current throttle: {throttle_cmd:.3f}")
+            print(f"Current brake: {brake_cmd:.3f}")
             print(f"Current Setpoint: {setpoints[idx]:.3f}")
             print(f"Current speed: {speed:.3f}")
+            print(f"Current X: {loc.x:.3f}")
+            print(f"Current Y: {loc.y:.3f}")
+            print(f"Current X: {loc.z:.3f}")
+
 
             control = carla.VehicleControl(
                 throttle=float(throttle_cmd),
