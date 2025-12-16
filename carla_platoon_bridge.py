@@ -1,8 +1,15 @@
 import argparse
 import math
+from multiprocessing import Queue
+import multiprocessing
+import queue
+import threading
 import time
+from functools import partial
 
 import carla
+import cv2
+import numpy as np
 import rclpy
 from rclpy.node import Node
 from rclpy.executors import MultiThreadedExecutor
@@ -13,6 +20,45 @@ from PID import PID
 from PlatooningROS import PlatoonMember
 
 
+#####################################
+# Dashcam process 
+#####################################
+def dashcam(img_queue):
+    time.sleep(5)
+    cv2.namedWindow("Dashboard camera", cv2.WINDOW_NORMAL)
+    payload = None
+    try:
+        while True:
+            try:
+                payload = img_queue.get(timeout=0.05)
+            except queue.Empty:
+                continue
+
+            if payload is None:
+                continue
+
+            try:
+                raw_bytes, width, height = payload[:3]
+                array = np.frombuffer(raw_bytes, dtype=np.uint8)
+                array = np.reshape(array, (height, width, 4))
+                array = array[:, :, :3]  # drop alpha
+
+                cv2.imshow("Dashboard camera", array)
+                if cv2.waitKey(1) == ord('q'):
+                    break
+            except KeyboardInterrupt:
+                print("Keyboard Interrupt caught!")
+                print("Cleaning up OpenCV...")
+                cv2.destroyAllWindows()
+                print("Destroyed all windows")
+
+    finally:
+        print("Exiting dashcam")
+        print("Cleaning up OpenCV...")
+        cv2.destroyAllWindows()
+        print("Destroyed all windows")
+
+
 class CarlaPlatoonBridge(Node):
     def __init__(
         self,
@@ -21,6 +67,7 @@ class CarlaPlatoonBridge(Node):
         plen: int,
         mcu_index: int,
         dt: float = 0.05,
+        img_queue=None
     ):
         super().__init__("carla_platoon_bridge")
 
@@ -32,8 +79,8 @@ class CarlaPlatoonBridge(Node):
         self._plen = plen
         self._mcu_index = mcu_index
         self._dt = dt
+        self._img_queue = img_queue
 
-        # ---- CARLA setup ----
         self.get_logger().info("Connecting to CARLA...")
         client = carla.Client(host, port)
         client.set_timeout(10.0)
@@ -60,18 +107,17 @@ class CarlaPlatoonBridge(Node):
 
         qos = QoSProfile(depth=1, reliability=QoSReliabilityPolicy.RELIABLE)
 
-        self._veh_names = []        # logical ROS names
-        self._vehicles = []         # CARLA vehicle actors
+        self._veh_names = []
+        self._vehicles = []
         self._speed_pubs = {}
         self._dist_pubs = {}
         self._throttle_subs = {}
         self._brake_subs = {}
-        self._last_cmd = {}         # name -> {"throttle": float, "brake": float}
+        self._last_cmd = {}
+        self._camera = None
+        self._camera_tf = None
 
         for i in range(plen):
-            # Naming scheme:
-            #  - index 0 is always the lead
-            #  - mcu_index uses "veh_ego" so it matches the MCU topics
             if i == 0:
                 ros_name = "veh_lead"
             elif i == mcu_index:
@@ -95,7 +141,6 @@ class CarlaPlatoonBridge(Node):
             self._veh_names.append(ros_name)
             self._vehicles.append(veh)
 
-            # ROS publishers for state
             self._speed_pubs[ros_name] = self.create_publisher(
                 Float32, f"{ros_name}/state/speed", qos
             )
@@ -103,43 +148,63 @@ class CarlaPlatoonBridge(Node):
                 Float32, f"{ros_name}/state/dist_to_veh", qos
             )
 
-            # Last commands default to zero
             self._last_cmd[ros_name] = {"throttle": 0.0, "brake": 0.0}
 
-            # ROS subscribers for commands
+            # Use functools.partial instead of a lambda so each callback
+            # is bound cleanly to its vehicle name.
             self._throttle_subs[ros_name] = self.create_subscription(
                 Float32,
                 f"{ros_name}/command/throttle",
-                lambda msg, n=ros_name: self._throttle_cb(msg, n),
+                partial(self._throttle_cb, name=ros_name),
                 qos,
             )
             self._brake_subs[ros_name] = self.create_subscription(
                 Float32,
                 f"{ros_name}/command/brake",
-                lambda msg, n=ros_name: self._brake_cb(msg, n),
+                partial(self._brake_cb, name=ros_name),
                 qos,
             )
-        
-        # Timer that advances CARLA and bridges data
+
+        if self._img_queue is not None and len(self._vehicles) > 0:
+            cam_bp = bp_library.find("sensor.camera.rgb")
+            cam_bp.set_attribute("image_size_x", "640")
+            cam_bp.set_attribute("image_size_y", "480")
+            cam_bp.set_attribute("fov", "90")
+
+
+            cam_transform = carla.Transform(carla.Location(x=0.0, y=10.0, z=10.0), carla.Rotation(yaw=-20.0, pitch=-35))
+
+
+            last_vehicle = self._vehicles[-1]
+            self._camera_tf = cam_transform
+            self._camera = world.spawn_actor(
+                cam_bp, cam_transform, attach_to=last_vehicle
+            )
+            self.get_logger().info(
+                f"Spawned {self._camera.type_id} attached to {self._veh_names[-1]}"
+            )
+
+            self._camera.listen(self._camera_cb)
+
         self._timer = self.create_timer(self._dt, self._step)
 
-    # --- Callbacks ---
-
     def _throttle_cb(self, msg: Float32, name: str):
-        self._last_cmd[name]["throttle"] = float(msg.data)
+        value = float(msg.data)
+        self._last_cmd[name]["throttle"] = value
+        # Debug: confirm that throttle commands are received by the bridge
+        print(f"[CB throttle] {name} <- {value:.2f}")
 
     def _brake_cb(self, msg: Float32, name: str):
-        self._last_cmd[name]["brake"] = float(msg.data)
-
-    # --- Main CARLA/ROS step ---
+        value = float(msg.data)
+        self._last_cmd[name]["brake"] = value
+        # Debug: confirm that brake commands are received by the bridge
+        print(f"[CB brake] {name} <- {value:.2f}")
 
     def _step(self):
-        # Advance CARLA by one synchronous tick
         self._world.tick()
         snapshot = self._world.get_snapshot()
         t = snapshot.timestamp.elapsed_seconds
 
-        # Read states
         speeds = []
         transforms = []
         for veh in self._vehicles:
@@ -149,7 +214,7 @@ class CarlaPlatoonBridge(Node):
             speeds.append(speed)
             transforms.append(tf)
 
-        # Publish speed and distance for each vehicle
+        dists = []
         for i, name in enumerate(self._veh_names):
             speed = speeds[i]
             self._speed_pubs[name].publish(Float32(data=float(speed)))
@@ -164,9 +229,9 @@ class CarlaPlatoonBridge(Node):
                     (prev_tf.location.x, prev_tf.location.y, prev_tf.location.z),
                 )
             self._dist_pubs[name].publish(Float32(data=float(dist_to_prev)))
+            dists.append(dist_to_prev)
 
-        # Apply last received commands to CARLA
-        for name, veh in zip(self._veh_names, self._vehicles):
+        for idx, (name, veh) in enumerate(zip(self._veh_names, self._vehicles)):
             cmd = self._last_cmd[name]
             throttle = max(0.0, min(1.0, cmd["throttle"]))
             brake = max(0.0, min(1.0, cmd["brake"]))
@@ -179,13 +244,40 @@ class CarlaPlatoonBridge(Node):
             )
             veh.apply_control(ctrl)
 
-        # Optional debug
-        self.get_logger().debug(
-            f"t={t:.2f}s lead_speed={speeds[0]:.2f}"
-        )
+            print(f"[CARLA {name}] t={t:.2f}s v={speeds[idx]:.2f} m/s ")
+            print(f"dist_prev={dists[idx]:.2f} m throttle={throttle:.2f} brake={brake:.2f}")
+
+    def _camera_cb(self, image: carla.Image):
+        """Camera callback to push latest frame into multiprocessing queue."""
+        if self._img_queue is None:
+            return
+
+        frame = (bytes(image.raw_data), image.width, image.height, image.frame)
+
+        try:
+            while True:
+                self._img_queue.get_nowait()
+        except queue.Empty:
+            pass
+
+        try:
+            self._img_queue.put_nowait(frame)
+        except queue.Full:
+            pass
 
     def destroy(self):
         self.get_logger().info("Destroying CARLA actors...")
+
+        if self._camera is not None:
+            try:
+                self._camera.stop()
+            except Exception:
+                pass
+            try:
+                self._camera.destroy()
+            except Exception:
+                pass
+
         for v in self._vehicles:
             try:
                 v.apply_control(carla.VehicleControl(throttle=0.0, brake=1.0))
@@ -200,7 +292,7 @@ class CarlaPlatoonBridge(Node):
         super().destroy_node()
 
 
-def main():
+def ros_p(img_queue):
     parser = argparse.ArgumentParser(description="CARLA–ROS platoon bridge with optional MCU")
     parser.add_argument("--host", type=str, default="localhost")
     parser.add_argument("--port", type=int, default=2000)
@@ -211,24 +303,22 @@ def main():
         default=1,
         help="Index [0..plen-1] of the MCU (micro-ROS) vehicle in the platoon",
     )
-    parser.add_argument("--dt", type=float, default=0.05, help="Control / CARLA step [s]")
+    parser.add_argument("--dt", type=float, default=0.01, help="Control / CARLA step [s]")
     args = parser.parse_args()
 
     rclpy.init()
 
-    # Bridge node (CARLA + ROS topics)
     bridge = CarlaPlatoonBridge(
         host=args.host,
         port=args.port,
         plen=args.plen,
         mcu_index=args.mcu_index,
         dt=args.dt,
+        img_queue=img_queue,
     )
 
-    # Create software PlatoonMember nodes for all NON-MCU vehicles
     nodes = [bridge]
 
-    # PID gains (tune as needed)
     kp = 0.26
     ki = 0.13
     kd = 0.006
@@ -238,7 +328,6 @@ def main():
 
     for i, name in enumerate(bridge._veh_names):
         if i == args.mcu_index:
-            # This one is controlled by the STM32H7 via micro-ROS
             continue
 
         role = "lead" if i == 0 else "follower"
@@ -281,6 +370,20 @@ def main():
             else:
                 n.destroy_node()
         rclpy.shutdown()
+
+
+def main():
+    img_queue = Queue(maxsize=1)
+
+    ps = [
+        multiprocessing.Process(target=ros_p, args=(img_queue,)),
+        multiprocessing.Process(target=dashcam, args=(img_queue,)),
+    ]
+
+    for p in ps:
+        p.start()
+    for p in ps:
+        p.join()
 
 
 if __name__ == "__main__":
