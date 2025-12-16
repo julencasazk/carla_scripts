@@ -80,6 +80,9 @@ def main(args, img_queue, char_queue, img_lock):
                                         # but should match the sampling
                                         # rate of the PID on the STM32
     settings.no_rendering_mode = False  # Camera feed is prefered, although not needed
+    settings.substepping = True
+    settings.max_substep_delta_time = 0.001
+    settings.max_substeps = 10 # Trying this to hopefully make the physics more reliable
     world.apply_settings(settings)
     print("Synchronous mode ON, dt = 0.01 s")
 
@@ -101,8 +104,6 @@ def main(args, img_queue, char_queue, img_lock):
     cam = world.spawn_actor(cam_bp, cam_transform, attach_to=vehicle)
     print(f"Spawned {cam.type_id}")
 
-    os.makedirs("spawn_point_imgs", exist_ok=True)
-
     def cam_cb(img):
         frame = (bytes(img.raw_data), img.width, img.height, img.frame)
         with frame_lock:
@@ -119,6 +120,27 @@ def main(args, img_queue, char_queue, img_lock):
         except queue.Full:
             pass
 
+    # Shared IMU acceleration state (X axis)
+    imu_accel_x = 0.0
+    imu_lock = threading.Lock()
+
+    imu_bp = bp_library.find('sensor.other.imu')
+    imu_bp.set_attribute('sensor_tick', '0.01')
+    # Attach IMU at vehicle origin (sensor frame X will be longitudinal)
+    imu_transform = carla.Transform()
+    imu = world.spawn_actor(imu_bp, imu_transform, attach_to=vehicle)
+    print(f"Spawned {imu.type_id}")
+
+    def imu_cb(imu_data):
+        nonlocal imu_accel_x
+        # IMU accelerometer is in sensor frame (m/s^2)
+        with imu_lock:
+            imu_accel_x = float(imu_data.accelerometer.x)
+
+    os.makedirs("spawn_point_imgs", exist_ok=True)
+
+
+    imu.listen(imu_cb)
     cam.listen(cam_cb)
 
     # CSV File for logging params
@@ -130,10 +152,8 @@ def main(args, img_queue, char_queue, img_lock):
         "time_s",
         "throttle",
         "brake",
-        "speed_m_s",
-        "accel_x_m_s2",
-        "accel_y_m_s2",
-        "accel_z_m_s2"
+        "speed",
+        "accel"
     ])
     csv_file.flush()
 
@@ -176,9 +196,20 @@ def main(args, img_queue, char_queue, img_lock):
     teleport_time = int(5.0 / dt)  # interval in steps
     # For doing controlled tests (no random throttle)
     # throttle_vals = [1.0, 0.0, 0.75, 0.0, 0.5, 0.0, 0.25, 0.0]
-    throttle_vals = [0.0, 0.80, 0.0, 0.75, 0.0, 0.7, 0.0, 0.65, 0.0, 0.60, 0.0, 0.55, 0.0, 0.5,
-                     0.0, 0.45, 0.0, 0.40, 0.0, 0.35, 0.0, 0.3, 0.0, 0.25, 0.0, 0.2, 0.0, 0.15, 0.0,
-                     0.10, 0.0, 0.05, 0.0]
+    throttle_vals = [0.0,
+                     0.8,
+                     0.0,
+                     0.5,
+                     0.4,
+                     0.7,
+                     0.75,
+                     0.2,
+                     0.0,
+                     0.1,
+                     0.45,
+                     0.3,
+                     0.8,
+                     0.0]
     idx = 0
     finished = False
     
@@ -222,7 +253,15 @@ def main(args, img_queue, char_queue, img_lock):
             
 
             vel = vehicle.get_velocity()
-            accel = vehicle.get_acceleration()
+            # Use IMU X-axis linear acceleration instead of actor acceleration
+            # Uncomment when using IMU instead of Actor acceleration
+            #with imu_lock:
+            #    accel = imu_accel_x
+            
+            # Just checking if physics improved
+            accel = vehicle.get_acceleration().x
+            # end checking
+            
             # Teleport every 5 seconds to stay in flat segment 
             # of highway continuously
             if step > 0 and step % teleport_time == 0:
@@ -261,9 +300,7 @@ def main(args, img_queue, char_queue, img_lock):
                 f"{throttle_cmd:.4f}",
                 f"{brake_cmd:.4f}",
                 f"{speed:.4f}",
-                f"{accel.x:.4f}",
-                f"{accel.y:.4f}",
-                f"{accel.z:.4f}",
+                f"{accel:.4f}"
             ])
             csv_file.flush()
             print(f"Step {step}/{total_steps}")
