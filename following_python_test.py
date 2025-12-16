@@ -104,7 +104,7 @@ def main(args, img_queue, char_queue, img_lock):
     base_spawn_point.location.z -= 0.3
 
     # Distance between vehicles in spawn (just so they don't collide at start)
-    initial_spacing = 5.0
+    initial_spacing = 10.0
 
     vehicle_bp = bp_library.find('vehicle.tesla.model3')
 
@@ -267,7 +267,7 @@ def main(args, img_queue, char_queue, img_lock):
                     )
                     new_tf = carla.Transform(
                         location=new_loc,
-                        rotation=ref_rotation   # <‑‑ NOT sp.rotation
+                        rotation=ref_rotation 
                     )
 
                     m.vehicle.set_transform(new_tf)
