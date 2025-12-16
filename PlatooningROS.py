@@ -34,7 +34,7 @@ class PlatoonMember(Node):
         min_spacing: float = 5.0,
         K_dist: float = 0.2,
         control_period: float = 0.05,
-        platoon_id: str = "main",
+        platoon_id: str = "plat_0",
     ):
         """
         role: "lead" or "follower"
@@ -42,7 +42,10 @@ class PlatoonMember(Node):
         """
         super().__init__(name)
 
-        self._name = f"{name}_node"
+        # Use the provided logical vehicle name (e.g. "veh_lead")
+        # directly as the topic namespace so it matches the bridge
+        # and micro-ROS firmware topic scheme.
+        self._name = name
         self._role = role
         self._pid = pid
         self._desired_time_headway = desired_time_headway
@@ -54,9 +57,16 @@ class PlatoonMember(Node):
         self._setpoint = 0.0       # local ACC speed setpoint [m/s]
         self._dist_to_veh = 0.0    # distance to preceding vehicle [m]
 
+        self._last_setpoint = 0.0  # Setpoint saving to avoid collisions when slowing down
+
         # Platoon state
-        self._platoon_enabled = False
+        self._platoon_enabled = True # On by default for testing
         self._platoon_sp = 0.0
+
+        # Debug / introspection variables (filled in compute_speed_setpoint)
+        self._last_base_sp = 0.0
+        self._last_eff_sp = 0.0
+        self._last_dist_err = 0.0
 
         qos_subs = QoSProfile(
             depth=1,
@@ -72,7 +82,7 @@ class PlatoonMember(Node):
             Float32,
             f"{self._name}/state/speed",
             self.speed_cb,
-            qos_pubs,
+            qos_subs,
         )
 
         # ACC / local setpoint
@@ -80,7 +90,7 @@ class PlatoonMember(Node):
             Float32,
             f"{self._name}/state/setpoint",
             self.setpoint_cb,
-            qos_pubs,
+            qos_subs,
         )
 
         # Distance to preceding vehicle
@@ -88,7 +98,7 @@ class PlatoonMember(Node):
             Float32,
             f"{self._name}/state/dist_to_veh",
             self.dist_to_veh_cb,
-            qos_pubs,
+            qos_subs,
         )
 
         # Platoon coordination topics (same for all vehicles)
@@ -96,27 +106,31 @@ class PlatoonMember(Node):
             Float32,
             f"/platoon/{platoon_id}/setpoint",
             self.platoon_sp_cb,
-            qos_pubs,
+            qos_subs,
         )
         self._platoon_mode_sub = self.create_subscription(
             Bool,
             f"{self._name}/state/platoon_enabled",
             self.platoon_mode_cb,
-            qos_pubs,
+            qos_subs,
         )
 
         # Publishers (unchanged)
         self._throttle_pub = self.create_publisher(
             Float32,
             f"{self._name}/command/throttle",
-            qos_pubs,
+            qos_subs,
         )
         self._brake_pub = self.create_publisher(
             Float32,
             f"{self._name}/command/brake",
-            qos_pubs,
+            qos_subs,
         )
 
+        # Timer-driven control loop by default. For fully deterministic
+        # coupling to a simulator tick (e.g. CARLA 100 Hz), the caller can
+        # disable this timer and invoke _control_loop or step_once() manually
+        # once per simulation step.
         self._timer = self.create_timer(control_period, self._control_loop)
 
     # --- Callbacks for state topics ---
@@ -131,6 +145,7 @@ class PlatoonMember(Node):
         self._dist_to_veh = float(msg.data)
 
     def platoon_sp_cb(self, msg: Float32):
+        self._last_setpoint = self._platoon_sp
         self._platoon_sp = float(msg.data)
 
     def platoon_mode_cb(self, msg: Bool):
@@ -159,14 +174,20 @@ class PlatoonMember(Node):
         else:
             base_sp = self._setpoint
 
+        # Store for debugging
+        self._last_base_sp = base_sp
+
         # If we have no information about a vehicle ahead, use base setpoint
         if self._dist_to_veh <= 0.0:
+            self._last_dist_err = 0.0
+            self._last_eff_sp = base_sp
             return base_sp
 
         # Compute spacing error
         desired_dist = speed * self._desired_time_headway + self._min_spacing
         desired_dist = max(self._min_spacing + 3.0, desired_dist)
         dist_err = self._dist_to_veh - desired_dist
+        self._last_dist_err = dist_err
 
         # --- Not in platoon: pure ACC behavior, only slow down when too close ---
         if not self._platoon_enabled:
@@ -176,7 +197,10 @@ class PlatoonMember(Node):
             else:
                 # Far enough or opening gap: do not increase beyond base setpoint
                 d_sp = 0.0
-            return base_sp + d_sp
+
+            eff_sp = base_sp + d_sp
+            self._last_eff_sp = eff_sp
+            return eff_sp
 
         # --- In platoon ---
         if self._role == "lead":
@@ -186,15 +210,25 @@ class PlatoonMember(Node):
                 d_sp = 2.0 * self._K_dist * dist_err
             else:
                 d_sp = 0.0
-            return base_sp + d_sp
+
+            eff_sp = base_sp + d_sp
+            self._last_eff_sp = eff_sp
+            return eff_sp
 
         # Follower in platoon: apply symmetric spacing correction (as before)
         if dist_err >= 0.0:
-            d_sp = self._K_dist * dist_err
+            # For safety, only speed up if the setpoint change is positive
+            # if platoon slowing, DONT close the gap accelerating.
+            if self._setpoint >= self._last_setpoint:
+                d_sp = self._K_dist * dist_err
+            else:
+                d_sp = 0.0
         else:
             d_sp = 2.0 * self._K_dist * dist_err
 
-        return base_sp + d_sp
+        eff_sp = base_sp + d_sp
+        self._last_eff_sp = eff_sp
+        return eff_sp
 
     def compute_control(self):
         """
@@ -223,3 +257,21 @@ class PlatoonMember(Node):
 
         self._throttle_pub.publish(Float32(data=throttle))
         self._brake_pub.publish(Float32(data=brake))
+
+        '''
+        # Debug printout so we can see what each vehicle is doing.
+        self.get_logger().info(
+            f"[{self._name}] role={self._role} platoon={self._platoon_enabled} "
+            f"v={self._speed:.2f} m/s dist={self._dist_to_veh:.2f} m "
+            f"base_sp={self._last_base_sp:.2f} eff_sp={self._last_eff_sp:.2f} "
+            f"throttle={throttle:.2f} brake={brake:.2f}"
+        )
+        '''
+
+    def step_once(self) -> None:
+        """Explicit one-shot control update.
+
+        Call this exactly once per simulator tick when you want full
+        control over timing instead of relying on the internal timer.
+        """
+        self._control_loop()
