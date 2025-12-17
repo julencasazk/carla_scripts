@@ -83,9 +83,9 @@ def main(args, img_queue, char_queue, img_lock):
                                         # but should match the sampling
                                         # rate of the PID on the STM32
     settings.no_rendering_mode = False  # Camera feed is prefered, although not needed
-    settings.substepping = True
-    settings.max_substep_delta_time = 0.001
-    settings.max_substeps = 10 # Trying this to hopefully make the physics more reliable
+    #settings.substepping = True
+    #settings.max_substep_delta_time = 0.001
+    #settings.max_substeps = 10 # Trying this to hopefully make the physics more reliable
     world.apply_settings(settings)
     print("Synchronous mode ON, dt = 0.01 s")
 
@@ -191,7 +191,9 @@ def main(args, img_queue, char_queue, img_lock):
     print(f"Base filename: {csv_filename_root}")
 
     teleport_time = int(15.0 / dt)  # interval in steps
-    teleport_cooldown_s = 1.5        # hold accel value for this time after teleport
+    # After each teleport, ignore samples for this cooldown window so that
+    # teleport-induced transients do not enter the logged data.
+    teleport_cooldown_s = 2.0
     teleport_cooldown_steps_required = int(teleport_cooldown_s / dt)
 
     # PID gains
@@ -248,9 +250,19 @@ def main(args, img_queue, char_queue, img_lock):
         phase_step_counter = 0
         current_delta = 0.0
 
-        # Teleport accel hold cooldown (to ignore transient acceleration spikes)
+        # Teleport cooldown counter for excluding samples from logs
         teleport_cooldown_steps = 0
-        last_accel_x = 0.0
+
+        # Acceleration estimation from speed: multi-step finite difference
+        # plus low-pass filtering to strongly attenuate sample-to-sample
+        # speed jitter.
+        accel_filt = 0.0
+        # Use a backward difference over this window (e.g. 0.1 s for N=10)
+        accel_window_steps = 10
+        speed_history = []
+        # First-order low-pass time constant (s) for acceleration estimate
+        accel_tau_s = 0.3
+        accel_beta = dt / accel_tau_s
 
         # Vehicle reset 
         vehicle.apply_control(carla.VehicleControl(throttle=0.0, brake=0.0))
@@ -272,22 +284,11 @@ def main(args, img_queue, char_queue, img_lock):
 
 
             vel = vehicle.get_velocity()
-
-            # Use vehicle actor's X acceleration, but optionally hold the
-            # previous value for a short time after teleport to smooth
-            # out the artificial spike caused by repositioning.
-            raw_accel_x = vehicle.get_acceleration().x
-
-            if teleport_cooldown_steps > 0:
-                accel_x = last_accel_x
-                teleport_cooldown_steps -= 1
-            else:
-                accel_x = raw_accel_x
-                last_accel_x = raw_accel_x
+            speed = math.sqrt(vel.x**2 + vel.y**2)
 
             # Teleport periodically back to the original spawn point to stay
             # in a safe road segment. Preserve target velocity and start the
-            # accel hold cooldown so logged accel remains smooth.
+            # cooldown so teleport-induced artifacts are excluded from logs.
             if step > 0 and step % teleport_time == 0:
                 vehicle.set_transform(spawn_point)
                 vehicle.set_target_velocity(vel)
@@ -298,8 +299,28 @@ def main(args, img_queue, char_queue, img_lock):
                     f"Teleport!! back to spawn at t={sim_time:.2f}s, "
                     f"speed={speed*3.6:.1f} km/h"
                 )
-            
-            speed = math.sqrt(vel.x**2 + vel.y**2)
+
+            # Acceleration estimation: multi-step finite difference of speed
+            # over a short window plus IIR low-pass. This behaves like
+            # differentiating a 0.1 s averaged speed, which greatly reduces
+            # sample-to-sample noise.
+            speed_history.append(speed)
+            if len(speed_history) > (accel_window_steps + 1):
+                # Keep only the last N+1 samples
+                speed_history.pop(0)
+
+            if len(speed_history) > accel_window_steps:
+                v_old = speed_history[0]
+                raw_accel = (speed - v_old) / (accel_window_steps * dt)
+            else:
+                raw_accel = 0.0
+
+            if teleport_cooldown_steps > 0:
+                # During cooldown, keep the previous filtered acceleration and
+                # just count down; these samples will not be logged.
+                teleport_cooldown_steps -= 1
+            else:
+                accel_filt = accel_filt + accel_beta * (raw_accel - accel_filt)
 
             current_setpoint = speed_operation_points[setpoint_idx]
 
@@ -372,8 +393,10 @@ def main(args, img_queue, char_queue, img_lock):
                             f"Advancing to next setpoint: {speed_operation_points[setpoint_idx]:.2f} m/s"
                         )
 
-                # Log data only during the test phase
-                if not finished:
+                # Log data only during the test phase and skip samples
+                # during the teleport cooldown window so that teleport-
+                # induced transients are not included in the dataset.
+                if (not finished) and (teleport_cooldown_steps == 0):
                     writer = csv_writers[setpoint_idx]
                     writer.writerow([
                         f"{sim_time:.4f}",
@@ -381,7 +404,7 @@ def main(args, img_queue, char_queue, img_lock):
                         f"{throttle_delta:.4f}",
                         f"{brake_cmd:.4f}",
                         f"{speed:.4f}",
-                        f"{accel_x:.4f}",
+                        f"{accel_filt:.4f}",
                     ])
                     csv_files[setpoint_idx].flush()
                 
@@ -401,7 +424,7 @@ def main(args, img_queue, char_queue, img_lock):
                 f"[Setpoint {setpoint_idx+1}/{len(speed_operation_points)}] "
                 f"sp={current_setpoint*3.6:.1f} km/h, "
                 f"speed={speed*3.6:.1f} km/h, "
-                f"accel_x={accel_x:.2f} m/s^2, "
+                f"accel_x={accel_filt:.2f} m/s^2, "
                 f"throttle={throttle_cmd:.3f}, "
                 f"delta={throttle_delta:.3f}, "
                 f"test={perturbation_index}/{num_perturbations}, "
