@@ -182,16 +182,16 @@ def main(args, img_queue, char_queue, img_lock):
         fname = f"{csv_filename_root}_{sp_kmh}kmh.csv"
         f = open(fname, mode="w", newline="")
         w = csv.writer(f)
-        w.writerow(["time_s", "throttle", "brake", "speed", "accel_x"])
+        # time, absolute throttle, throttle delta, brake, speed, accel
+        w.writerow(["time_s", "throttle", "throttle_delta", "brake", "speed", "accel_x"])
         csv_files.append(f)
         csv_writers.append(w)
 
     print(f"Running step test: dt={dt}s, total_time={total_time}s")
     print(f"Base filename: {csv_filename_root}")
 
-    teleport_time = int(10.0 / dt)  # interval in steps
-    teleport_reset_distance = 300.0  # meters to move back along the lane when teleporting
-    teleport_cooldown_s = 1.0        # do not log during this time after a teleport
+    teleport_time = int(15.0 / dt)  # interval in steps
+    teleport_cooldown_s = 1.5        # hold accel value for this time after teleport
     teleport_cooldown_steps_required = int(teleport_cooldown_s / dt)
 
     # PID gains
@@ -211,11 +211,11 @@ def main(args, img_queue, char_queue, img_lock):
     stable_steps_required = int(stable_time_s / dt)
 
     # Perturbation test configuration
-    delta_time_s = 5.0               # duration of each delta (s)
-    base_time_s = 5.0                # duration back at ref throttle between deltas (s)
+    delta_time_s = 7.5               # duration of each random delta (s)
+    base_time_s = 5.0                # unused now, kept for reference
     delta_steps = int(delta_time_s / dt)
     base_steps = int(base_time_s / dt)
-    num_perturbations = 30           # how many delta cycles per setpoint
+    num_perturbations = 30           # how many random deltas per setpoint
     
     try:
         # Sim time counter 
@@ -237,6 +237,7 @@ def main(args, img_queue, char_queue, img_lock):
         throttle_cmd = 0.0
         brake_cmd = 0.0
         ref_throttle = 0.0
+        throttle_delta = 0.0
 
         # Stabilization tracking
         stable_steps = 0
@@ -247,8 +248,9 @@ def main(args, img_queue, char_queue, img_lock):
         phase_step_counter = 0
         current_delta = 0.0
 
-        # Teleport logging cooldown (to ignore transient acceleration spikes)
+        # Teleport accel hold cooldown (to ignore transient acceleration spikes)
         teleport_cooldown_steps = 0
+        last_accel_x = 0.0
 
         # Vehicle reset 
         vehicle.apply_control(carla.VehicleControl(throttle=0.0, brake=0.0))
@@ -271,37 +273,31 @@ def main(args, img_queue, char_queue, img_lock):
 
             vel = vehicle.get_velocity()
 
-            # Use vehicle actor's X acceleration
-            accel_x = vehicle.get_acceleration().x
-            
-            # Teleport periodically to stay in a flat segment of highway,
-            # but keep the vehicle on the drivable lane, preserve its
-            # velocity, and start a short cooldown where we do not log
-            # acceleration to avoid spikes from the teleport.
+            # Use vehicle actor's X acceleration, but optionally hold the
+            # previous value for a short time after teleport to smooth
+            # out the artificial spike caused by repositioning.
+            raw_accel_x = vehicle.get_acceleration().x
+
+            if teleport_cooldown_steps > 0:
+                accel_x = last_accel_x
+                teleport_cooldown_steps -= 1
+            else:
+                accel_x = raw_accel_x
+                last_accel_x = raw_accel_x
+
+            # Teleport periodically back to the original spawn point to stay
+            # in a safe road segment. Preserve target velocity and start the
+            # accel hold cooldown so logged accel remains smooth.
             if step > 0 and step % teleport_time == 0:
-                current_tf = vehicle.get_transform()
-                current_wp = world.get_map().get_waypoint(
-                    current_tf.location,
-                    project_to_road=True,
-                    lane_type=carla.LaneType.Driving,
-                )
-
-                # Move back along the lane by teleport_reset_distance meters, if possible
-                prev_wps = current_wp.previous(teleport_reset_distance)
-                target_wp = prev_wps[0] if prev_wps else current_wp
-
-                vehicle.set_transform(target_wp.transform)
-                vehicle.set_velocity(vel)
-                vehicle.set_angular_velocity(carla.Vector3D(0.0, 0.0, 0.0))
+                vehicle.set_transform(spawn_point)
+                vehicle.set_target_velocity(vel)
+                vehicle.set_target_angular_velocity(carla.Vector3D(0.0, 0.0, 0.0))
 
                 teleport_cooldown_steps = teleport_cooldown_steps_required
                 print(
-                    f"Teleport!! to new waypoint at t={sim_time:.2f}s, "
+                    f"Teleport!! back to spawn at t={sim_time:.2f}s, "
                     f"speed={speed*3.6:.1f} km/h"
                 )
-
-            if teleport_cooldown_steps > 0:
-                teleport_cooldown_steps -= 1
             
             speed = math.sqrt(vel.x**2 + vel.y**2)
 
@@ -310,6 +306,7 @@ def main(args, img_queue, char_queue, img_lock):
             if state == STATE_APPROACH:
                 # Use PID to drive speed toward the current setpoint
                 throttle_cmd = pid.step(current_setpoint, speed)
+                throttle_delta = 0.0
 
                 # Check if speed is within the stability band
                 if abs(speed - current_setpoint) <= speed_band:
@@ -326,43 +323,39 @@ def main(args, img_queue, char_queue, img_lock):
                         f"with ref_throttle={ref_throttle:.3f}"
                     )
 
-                    # Reset test state counters
+                    # Reset test state counters and pick the first random delta
                     perturbation_index = 0
                     phase_is_delta = False
                     phase_step_counter = 0
-                    current_delta = 0.0
+                    # Slightly larger deltas for higher setpoints
+                    base_delta_mag = 0.02
+                    scale = 1.0 + 0.3 * float(setpoint_idx)
+                    max_delta = base_delta_mag * scale
+                    current_delta = float(np.random.uniform(-max_delta, max_delta))
 
                     state = STATE_TEST
 
             elif state == STATE_TEST:
-                # Open-loop throttle perturbation tests around ref_throttle
+                # Open-loop throttle perturbation tests around ref_throttle.
+                # Apply a random delta around ref_throttle for delta_time_s,
+                # then immediately switch to another random delta without
+                # explicitly returning to ref_throttle in between.
                 if perturbation_index < num_perturbations:
-                    if phase_is_delta:
-                        # During delta phase: apply ref_throttle + current_delta
-                        throttle_cmd = ref_throttle + current_delta
-                        throttle_cmd = max(0.0, min(1.0, throttle_cmd))
-                        phase_step_counter += 1
+                    # Apply current random delta around ref_throttle
+                    throttle_cmd = ref_throttle + current_delta
+                    throttle_cmd = max(0.0, min(1.0, throttle_cmd))
+                    throttle_delta = throttle_cmd - ref_throttle
+                    phase_step_counter += 1
 
-                        if phase_step_counter >= delta_steps:
-                            # End of delta phase -> go back to base (ref_throttle)
-                            phase_is_delta = False
-                            phase_step_counter = 0
-                            perturbation_index += 1
-                    else:
-                        # Base phase at reference throttle
-                        throttle_cmd = ref_throttle
-                        phase_step_counter += 1
-
-                        if phase_step_counter >= base_steps:
-                            # Start a new delta phase with a small random delta
-                            # Slightly larger deltas for higher setpoints
+                    if phase_step_counter >= delta_steps:
+                        # Move on to the next random delta
+                        phase_step_counter = 0
+                        perturbation_index += 1
+                        if perturbation_index < num_perturbations:
                             base_delta_mag = 0.02
                             scale = 1.0 + 0.3 * float(setpoint_idx)
                             max_delta = base_delta_mag * scale
                             current_delta = float(np.random.uniform(-max_delta, max_delta))
-
-                            phase_is_delta = True
-                            phase_step_counter = 0
                 else:
                     # Finished perturbations for this setpoint
                     setpoint_idx += 1
@@ -374,17 +367,18 @@ def main(args, img_queue, char_queue, img_lock):
                         pid = PID(kp, ki, kd, N_d, dt, 0.0, 1.0, kb_aw, True, False)
                         state = STATE_APPROACH
                         stable_steps = 0
+                        throttle_delta = 0.0
                         print(
                             f"Advancing to next setpoint: {speed_operation_points[setpoint_idx]:.2f} m/s"
                         )
 
-                # Log data only during the test phase and when we are
-                # not in a cooldown window after a teleport
-                if not finished and teleport_cooldown_steps == 0:
+                # Log data only during the test phase
+                if not finished:
                     writer = csv_writers[setpoint_idx]
                     writer.writerow([
                         f"{sim_time:.4f}",
                         f"{throttle_cmd:.4f}",
+                        f"{throttle_delta:.4f}",
                         f"{brake_cmd:.4f}",
                         f"{speed:.4f}",
                         f"{accel_x:.4f}",
@@ -409,6 +403,7 @@ def main(args, img_queue, char_queue, img_lock):
                 f"speed={speed*3.6:.1f} km/h, "
                 f"accel_x={accel_x:.2f} m/s^2, "
                 f"throttle={throttle_cmd:.3f}, "
+                f"delta={throttle_delta:.3f}, "
                 f"test={perturbation_index}/{num_perturbations}, "
                 f"state={state_name}, "
                 f"t={sim_time:.2f}s, step={step}/{total_steps}"
