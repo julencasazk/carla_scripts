@@ -68,6 +68,27 @@ class PlatoonMember(Node):
         self._last_eff_sp = 0.0
         self._last_dist_err = 0.0
 
+        # Optional debug logging for timing/behavior (used mainly for leader)
+        self._debug_step_idx = 0
+        self._debug_writer = None
+        if self._role == "lead":
+            try:
+                import csv  # local import to avoid unused at module level
+                self._debug_log_file = open(f"{self._name}_debug.csv", mode="w", newline="")
+                self._debug_writer = csv.writer(self._debug_log_file)
+                self._debug_writer.writerow([
+                    "step_idx",
+                    "wall_time_s",
+                    "speed_meas",
+                    "speed_sp",
+                    "dist_to_veh",
+                    "platoon_sp",
+                    "local_setpoint_base",
+                ])
+                self._debug_log_file.flush()
+            except Exception:
+                self._debug_writer = None
+
         qos_subs = QoSProfile(
             depth=1,
             reliability=QoSReliabilityPolicy.RELIABLE,
@@ -126,6 +147,21 @@ class PlatoonMember(Node):
             f"{self._name}/command/brake",
             qos_subs,
         )
+        
+        self._local_sp_pub = self.create_publisher(
+            Float32,
+            f"{self._name}/state/local_setpoint",
+            qos_subs,
+        )
+        
+        # For the leader, update the platoon global setpoint to match its own
+        self._platoon_sp_pub = self.create_publisher(
+            Float32,
+            f"/platoon/{platoon_id}/setpoint",
+            qos_subs,
+        )
+
+        
 
         # Timer-driven control loop by default. For fully deterministic
         # coupling to a simulator tick (e.g. CARLA 100 Hz), the caller can
@@ -185,7 +221,6 @@ class PlatoonMember(Node):
 
         # Compute spacing error
         desired_dist = speed * self._desired_time_headway + self._min_spacing
-        desired_dist = max(self._min_spacing + 3.0, desired_dist)
         dist_err = self._dist_to_veh - desired_dist
         self._last_dist_err = dist_err
 
@@ -213,6 +248,10 @@ class PlatoonMember(Node):
 
             eff_sp = base_sp + d_sp
             self._last_eff_sp = eff_sp
+
+            # Leader updates the global platoon septoint
+            self._platoon_sp_pub.publish(Float32(data=eff_sp))
+
             return eff_sp
 
         # Follower in platoon: apply symmetric spacing correction (as before)
@@ -238,6 +277,26 @@ class PlatoonMember(Node):
         speed_sp = self.compute_speed_setpoint()
         speed_meas = self._speed
 
+        # Debug: for the leader, log each control step with wall time and
+        # key signals so we can inspect effective timing and behavior.
+        if self._debug_writer is not None:
+            try:
+                now = self.get_clock().now().to_msg()
+                wall_t = float(now.sec) + float(now.nanosec) * 1e-9
+                self._debug_writer.writerow([
+                    self._debug_step_idx,
+                    f"{wall_t:.9f}",
+                    f"{speed_meas:.6f}",
+                    f"{speed_sp:.6f}",
+                    f"{self._dist_to_veh:.6f}",
+                    f"{self._platoon_sp:.6f}",
+                    f"{self._setpoint:.6f}",
+                ])
+                self._debug_log_file.flush()
+                self._debug_step_idx += 1
+            except Exception:
+                pass
+
         u = self._pid.step(speed_sp, speed_meas)
 
         if u > 0.0:
@@ -247,16 +306,17 @@ class PlatoonMember(Node):
             throttle = 0.0
             brake = float(abs(u))
 
-        return throttle, brake
+        return throttle, brake, speed_sp
 
     def _control_loop(self):
         """
         Periodic timer callback: compute and publish throttle/brake commands.
         """
-        throttle, brake = self.compute_control()
+        throttle, brake, speed_sp = self.compute_control()
 
         self._throttle_pub.publish(Float32(data=throttle))
         self._brake_pub.publish(Float32(data=brake))
+        self._local_sp_pub.publish(Float32(data=speed_sp))
 
         '''
         # Debug printout so we can see what each vehicle is doing.
