@@ -70,6 +70,14 @@ class FollowingRosTest(Node):
         # Latest commands from PlatoonMember nodes (name -> dict)
         self._last_cmd = {}
 
+        # Latest local speed setpoints from PlatoonMember nodes (name -> float)
+        self._last_local_sp = {}
+
+        # Per-vehicle spacing policy parameters (to mirror PlatoonMember)
+        # and allow computing desired distances in this bridge.
+        self._desired_time_headways = {}
+        self._min_spacings = {}
+
         # CARLA setup
         self.get_logger().info("Connecting to CARLA...")
         client = carla.Client(args.host, args.port)
@@ -85,6 +93,9 @@ class FollowingRosTest(Node):
         settings.synchronous_mode = True
         settings.fixed_delta_seconds = self.Ts
         settings.no_rendering_mode = False
+        #settings.substepping = True
+        #settings.max_substep_delta_time = 0.001
+        #settings.max_substeps = 10 # Trying this to hopefully make the physics more reliable
         world.apply_settings(settings)
         self.get_logger().info(f"Synchronous mode ON, dt = {self.Ts} s")
 
@@ -95,7 +106,7 @@ class FollowingRosTest(Node):
         vehicle_bp = bp_library.find("vehicle.tesla.model3")
 
         # Distance between vehicles at spawn so they don't collide immediately
-        self.initial_spacing = 10.0
+        self.initial_spacing = 15.0
 
         self.vehicles = []
 
@@ -107,7 +118,7 @@ class FollowingRosTest(Node):
                 location=carla.Location(
                     x=base_spawn_point.location.x + i * self.initial_spacing,
                     y=base_spawn_point.location.y,
-                    z=base_spawn_point.location.z,
+                    z=base_spawn_point.location.z - i * 0.05,
                 ),
                 rotation=base_spawn_point.rotation,
             )
@@ -118,6 +129,11 @@ class FollowingRosTest(Node):
 
             self.ros_names.append(ros_name)
             self.vehicles.append(veh)
+
+            # Store spacing parameters (mirror of PlatoonMember construction)
+            # so we can compute desired distances here for logging.
+            self._desired_time_headways[ros_name] = 0.7 if i == 1 else 0.3
+            self._min_spacings[ros_name] = 10.0
 
             # State publishers
             self.speed_pubs[ros_name] = self.create_publisher(
@@ -135,6 +151,7 @@ class FollowingRosTest(Node):
 
             # Command subscribers; controllers are PlatoonMember nodes
             self._last_cmd[ros_name] = {"throttle": 0.0, "brake": 0.0}
+            self._last_local_sp[ros_name] = 0.0
 
             self.create_subscription(
                 Float32,
@@ -146,6 +163,15 @@ class FollowingRosTest(Node):
                 Float32,
                 f"{ros_name}/command/brake",
                 lambda msg, n=ros_name: self._brake_cb(msg, n),
+                10,
+            )
+
+            # Local setpoint subscribers: each PlatoonMember publishes its
+            # own local speed setpoint on <name>/state/local_setpoint
+            self.create_subscription(
+                Float32,
+                f"{ros_name}/state/local_setpoint",
+                lambda msg, n=ros_name: self._local_sp_cb(msg, n),
                 10,
             )
 
@@ -181,20 +207,27 @@ class FollowingRosTest(Node):
         except Exception as e:
             self.get_logger().warn(f"Failed to create dashcam: {e}")
 
-        # CSV logging (ego vehicle only)
+        # CSV logging (all vehicles)
         csv_filename = args.f
         self.csv_file = open(csv_filename, mode="w", newline="")
         self.csv_writer = csv.writer(self.csv_file)
-        self.csv_writer.writerow([
-            "time_s",
-            "throttle",
-            "setpoint",
-            "brake",
-            "speed_m_s",
-            "accel_x_m_s2",
-            "accel_y_m_s2",
-            "accel_z_m_s2",
-        ])
+
+        # Build header: time_s, then for each vehicle a block of
+        # throttle_<name>, brake_<name>, speed_<name>, accel_x_<name>,
+        # local_sp_<name>, dist_to_prev_<name>, desired_dist_<name>
+        header = ["time_s"]
+        for i, name in enumerate(self.ros_names):
+            suffix = "lead" if i == 0 else str(i)
+            header.extend([
+                f"throttle_{suffix}",
+                f"brake_{suffix}",
+                f"speed_{suffix}",
+                f"accel_x_{suffix}",
+                f"local_sp_{suffix}",
+                f"dist_to_prev_{suffix}",
+                f"desired_dist_{suffix}",
+            ])
+        self.csv_writer.writerow(header)
         self.csv_file.flush()
         self.get_logger().info(f"Logging to: {csv_filename}")
 
@@ -203,7 +236,7 @@ class FollowingRosTest(Node):
         self.total_time = 3600.0
         self.total_steps = int(self.total_time / self.dt)
 
-        self.teleport_time = int(5.0 / self.dt)
+        self.teleport_time = int(15.0 / self.dt)
         # Lead speed setpoints (global platoon reference, m/s)
         self.lead_speed_setpoints = [
             0.0,
@@ -225,10 +258,14 @@ class FollowingRosTest(Node):
         self.sim_time = 0.0
         self.start_timestamp = None
         self.step = 0
+        # Minimum time between setpoint changes (in steps)
         self.last_change_step = 0
-        self.last_change_speed = 0.0
         self.band = 0.2
         self.min_wait_steps = int(5.0 / self.dt)
+        # Require speed to be close to the current target for a
+        # contiguous window before changing to the next step.
+        self.stable_steps_required = int(3.0 / self.dt)
+        self._stable_counter = 0
 
         # Vehicle reset
         for v in self.vehicles:
@@ -249,6 +286,11 @@ class FollowingRosTest(Node):
         value = float(msg.data)
         if name in self._last_cmd:
             self._last_cmd[name]["brake"] = value
+
+    def _local_sp_cb(self, msg: Float32, name: str) -> None:
+        value = float(msg.data)
+        if name in self._last_local_sp:
+            self._last_local_sp[name] = value
 
     def _camera_callback(self, image: carla.Image) -> None:
         """Camera callback: push latest frame into queue (non-blocking)."""
@@ -346,7 +388,7 @@ class FollowingRosTest(Node):
                 new_loc = carla.Location(
                     x=base_spawn_point.location.x + dist_along * forward_x,
                     y=base_spawn_point.location.y + dist_along * forward_y,
-                    z=base_spawn_point.location.z,
+                    z=base_spawn_point.location.z - (i * 0.05),
                 )
                 spawn_tf = carla.Transform(location=new_loc, rotation=base_spawn_point.rotation)
                 v.set_transform(spawn_tf)
@@ -393,46 +435,71 @@ class FollowingRosTest(Node):
             # Always in platoon mode for this test
             self.platoon_mode_pubs[name].publish(Bool(data=True))
 
-        # Ego vehicle index and state
-        ego_idx = self.ego_index
-        ego_speed = speeds[ego_idx]
-        ego_accel = accels[ego_idx]
+        # Compute desired distances according to spacing policy used in
+        # PlatoonMember: desired_dist = speed * desired_time_headway + min_spacing
+        desired_dists = []
+        for i, name in enumerate(self.ros_names):
+            if i == 0:
+                # Leader has no vehicle ahead; define 0 for convenience
+                desired_dists.append(0.0)
+                continue
 
-        # Stability-based setpoint change logic (based on ego speed)
-        if (self.step - self.last_change_step) >= self.min_wait_steps:
-            if abs(speeds[0] - self.last_change_speed) <= self.band:
-                if self.lead_sp_idx == (len(self.lead_speed_setpoints) - 1):
-                    self.finished = True
-                else:
-                    self.lead_sp_idx = (self.lead_sp_idx + 1) % len(self.lead_speed_setpoints)
-                self.get_logger().info(
-                    f"Lead SP change to {self.lead_speed_setpoints[self.lead_sp_idx]:.3f} m/s "
-                    f"at t={self.sim_time:.2f}s (ego speed: {speeds[0]:.2f} m/s)"
-                )
+            th = float(self._desired_time_headways.get(name, 0.3))
+            ms = float(self._min_spacings.get(name, 5.0))
+            v = float(speeds[i])
+            desired_dists.append(v * th + ms)
+
+        # Stability-based setpoint change logic (based on leader speed
+        # being close to its current target for a contiguous window).
+        target_sp = sp
+        if abs(speeds[0] - target_sp) <= self.band:
+            self._stable_counter += 1
+        else:
+            self._stable_counter = 0
+
+        if (
+            (self.step - self.last_change_step) >= self.min_wait_steps
+            and self._stable_counter >= self.stable_steps_required
+        ):
+            if self.lead_sp_idx == (len(self.lead_speed_setpoints) - 1):
+                self.finished = True
+            else:
+                self.lead_sp_idx = (self.lead_sp_idx + 1) % len(self.lead_speed_setpoints)
+            self.get_logger().info(
+                f"Lead SP change to {self.lead_speed_setpoints[self.lead_sp_idx]:.3f} m/s "
+                f"at t={self.sim_time:.2f}s (leader speed: {speeds[0]:.2f} m/s)"
+            )
             self.last_change_step = self.step
-            self.last_change_speed = speeds[0]
+            self._stable_counter = 0
 
-        # Ego logging to CSV (commands currently in effect for this step)
-        ego_name = self.ros_names[ego_idx]
-        ego_cmd = self._last_cmd.get(ego_name, {"throttle": 0.0, "brake": 0.0})
-        ego_throttle = float(ego_cmd["throttle"])
-        ego_brake = float(ego_cmd["brake"])
+        # Logging to CSV: per-vehicle throttle, brake, speed, accel_x,
+        # local setpoint, distance to previous, desired distance
+        row = [f"{self.sim_time:.4f}"]
+        for i, name in enumerate(self.ros_names):
+            cmd = self._last_cmd.get(name, {"throttle": 0.0, "brake": 0.0})
+            throttle = float(cmd["throttle"])
+            brake = float(cmd["brake"])
+            speed_i = float(speeds[i])
+            accel_x_i = float(accels[i].x)
+            local_sp = float(self._last_local_sp.get(name, sp))
+            dist_i = float(dists[i])
+            desired_dist_i = float(desired_dists[i])
 
-        self.csv_writer.writerow([
-            f"{self.sim_time:.4f}",
-            f"{ego_throttle:.4f}",
-            f"{sp:.4f}",
-            f"{ego_brake:.4f}",
-            f"{ego_speed:.4f}",
-            f"{ego_accel.x:.4f}",
-            f"{ego_accel.y:.4f}",
-            f"{ego_accel.z:.4f}",
-        ])
+            row.extend([
+                f"{throttle:.4f}",
+                f"{brake:.4f}",
+                f"{speed_i:.4f}",
+                f"{accel_x_i:.4f}",
+                f"{local_sp:.4f}",
+                f"{dist_i:.4f}",
+                f"{desired_dist_i:.4f}",
+            ])
+
+        self.csv_writer.writerow(row)
         self.csv_file.flush()
 
         self.get_logger().info(
-            f"Step {self.step}/{self.total_steps} t={self.sim_time:.2f}s "
-            f"SP={sp:.2f} ego_v={ego_speed:.2f} Th={ego_throttle:.2f} Br={ego_brake:.2f}"
+            f"Step {self.step}/{self.total_steps} t={self.sim_time:.2f}s SP={sp:.2f}"
         )
 
         self.step += 1
@@ -529,19 +596,33 @@ def main():
     nodes = [bridge]
     for i, name in enumerate(bridge.ros_names):
         role = "lead" if i == 0 else "follower"
-        k = 0.3 + (0.1 * i) 
+        k = 1 + (0.1 * i)
 
         pid = PID(kp, ki, kd, N_d, Ts, u_min, u_max, kb_aw, der_on_meas=True)
+
+        # Use the same spacing parameters as stored in the bridge so that the
+        # desired distance used by controllers matches what is logged.
+        desired_time_headway = float(bridge._desired_time_headways.get(name, 0.3))
+        min_spacing = float(bridge._min_spacings.get(name, 5.0))
 
         member = PlatoonMember(
             name=name,
             role=role,
             pid=pid,
-            desired_time_headway=0.7 if i == 1 else 0.3,
-            min_spacing=5.0,
+            desired_time_headway=desired_time_headway,
+            min_spacing=min_spacing,
             K_dist=k,
             control_period=Ts,
         )
+
+        # We drive the control loop explicitly via step_once() once per
+        # CARLA tick in the main loop below. Disable the internal timer so
+        # the PID is stepped exactly at Ts = 0.01 s, matching its tuning.
+        try:
+            member._timer.cancel()
+        except Exception:
+            pass
+
         nodes.append(member)
 
     executor = MultiThreadedExecutor()
