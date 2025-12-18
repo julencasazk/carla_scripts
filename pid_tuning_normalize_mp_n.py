@@ -240,7 +240,9 @@ def sim_closed_loop_pid(kp, ki, kd,
     y = np.zeros_like(t, dtype=float)
     u = np.zeros_like(t, dtype=float)
 
-    # Gaussian measurement noise
+    # Some gaussian noise to measurement so that the resulting
+    # pid is more robust to small variations.
+    # Might penalize derivative component heavily, dunno lol
     meas_noise_std = 0.05
 
     for k in range(n_steps):
@@ -539,14 +541,14 @@ def pid_cost_normalized(x,
 
     if weights is None:
         weights = {
-            "SSE":    3.0,
+            "SSE":    5.0,
             "OS":     3.0,
-            "TsTr":   4.0,
-            "RVG":    0.1,
-            "ODJ":    0.2,
-            "u_rms":  0.5,
-            "du_rms": 1.0,
-            "sat_ratio": 1.0,
+            "TsTr":   0.0,
+            "RVG":    0.0,
+            "ODJ":    0.0,
+            "u_rms":  0.0,
+            "du_rms": 4.0,
+            "sat_ratio": 0.0,
         }
 
     J = 0.0
@@ -595,8 +597,14 @@ def main(args):
 
     # General settings
     Ts = 0.01
-    u_min = 0.0
-    u_max = 1.0
+    # Now u are delta_u, so u_min and u_max are just the maxixmum and minimum offset from
+    # from the u that takes the vehicle to the center of the range.
+    u_ref = 0.68
+    u_range_max = 0.73
+    u_range_min = 0.62
+    
+    u_min = u_range_min - u_ref
+    u_max = u_range_max - u_ref
     T_sim = 80.0
 
     s = ctl.TransferFunction.s
@@ -609,12 +617,17 @@ def main(args):
     Gc = G0 * H_delay
     Gd = ctl.c2d(Gc, Ts, method="tustin")
     '''
-    
-    # Plant fitted with "reasonable" speeds
-    G0 = (8.7129*s + 0.05263) / (s**2 + 0.1953*s + 0.0001874) 
+   
+    # Plants for each range, only leave one uncommented, obviously
+    #G0 = 7.841 / (s + 0.3321) # Low speed range
+    #G0 = (56.37*s**2 + 155.6*s + 2.604) / (s**3 + 15.58*s**2 + 2.633*s + 0.08517) # middle range
+    G0 = (45.58*s**2 + 23.78*s + 2.604) / (s**3 + 2.405*s**2 + 0.2322*s + 0.01443) # High speed range
     Gd = ctl.c2d(G0, Ts, method='tustin')
     
-    setpoint = 20.00
+    range_max = 33.33333
+    range_min = 22.22222
+    
+    setpoint = (range_max - range_min) / 2.0
 
     # PID search bounds: [kp, ki, kd, N]
     bounds = [
