@@ -61,17 +61,28 @@ def main(args, img_queue, char_queue, img_lock):
     print("Setting up PID controller")
 
     Ts = 0.01
-
-    # PID gains (from PSO)
-    kp = 2.59397071e-01
-    ki = 1.27381733e-01
-    kd = 6.21160744e-03
-    N_d = 5.0
+    u_min = 0.0
+    u_max = 1.0
     kb_aw = 1.0
-    u_min, u_max = -1.0, 1.0
-
-
-    pid = PID(kp, ki, kd, N_d, Ts, u_min, u_max, kb_aw, der_on_meas=True)
+    # Low speed range PID
+    kp_low =   5.61726331e-02
+    ki_low =   7.85334963e-03
+    kd_low =   0.0
+    N_d_low =  15.0
+    # Mid speed range PID
+    kp_mid =   5.61726331e-02
+    ki_mid =   7.85334963e-03
+    kd_mid =   0.0
+    N_d_mid =  15.0
+    # High speed range PID
+    kp_high =   5.61726331e-02
+    ki_high =   7.85334963e-03
+    kd_high =   0.0
+    N_d_high =  15.0
+    
+    pid_low = PID(kp_low, ki_low, kd_low, N_d_low, Ts, u_min, u_max, kb_aw, der_on_meas=True)
+    pid_mid = PID(kp_mid, ki_mid, kd_mid, N_d_mid, Ts, u_min, u_max, kb_aw, der_on_meas=True)
+    pid_high = PID(kp_high, ki_high, kd_high, N_d_high, Ts, u_min, u_max, kb_aw, der_on_meas=True)
 
 
     latest_frame = None
@@ -164,16 +175,16 @@ def main(args, img_queue, char_queue, img_lock):
     print(f"Running step test: dt={dt}s, total_time={total_time}s")
     print(f"Logging to: {csv_filename}")
 
-    teleport_time = int(5.0 / dt)  # interval in steps
+    teleport_time = int(15.0 / dt)  # interval in steps
     # For doing controlled tests (no random throttle)
     # Incremental tests: sp1 -> 0.0 -> sp2 -> 0.0 ...
-    # setpoints = [0.0, 5.0, 0.0, 10.0, 0.0, 15.0, 0.0, 20.0, 0.0, 25.0, 0.0, 30.0, 0.0]
-    # More random values
-    setpoints = [0.0, 33.00, 30.00, 24.00, 15.00, 17.00, 22.00, 4.00, 13.34, 0.00, 1.00, 2.00, 13.00, 0.00]
-
+    #setpoints = [0.0, 11.11, 5.55, 2.25, 7.5, 11.11, 0.0] # Low range
+    #setpoints = [11.11, 22.22, 16.66666, 13.0, 20.0, 22.22, 11.11] # Middle range
+    setpoints = [22.22, 33.33, 27.77777, 24.4, 30.0, 33.33, 22.22] # Hight range
+    #setpoints = [5.55, 11.1111, 16.66666, 22.2222, 27.777777, 33.333333] # Middlepoint reference checking.
     y = np.zeros_like(total_steps)
     u = np.zeros_like(total_steps)
-
+    
     idx = 0
     finished = False
     
@@ -223,11 +234,16 @@ def main(args, img_queue, char_queue, img_lock):
                 print("Teleport!!")
             
             speed = math.sqrt(vel.x**2 + vel.y**2)
-
-            u = pid.step(setpoints[idx], speed)
-
+           
+            if (speed >= 22.22):
+                u = pid_high.step(setpoints[idx], speed)
+            elif (speed >= 11.11):
+                u = pid_mid.step(setpoints[idx], speed)
+            else:
+                u = pid_low.step(setpoints[idx], speed)
+            
             if u > 0.0:
-                throttle_cmd = u
+                throttle_cmd = u if u > 0.06 else 0.0 # Deadband to avoid oscillating above 0m/s
                 brake_cmd = 0.0
             else:
                 throttle_cmd = 0.0
