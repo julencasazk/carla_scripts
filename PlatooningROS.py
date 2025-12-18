@@ -29,7 +29,9 @@ class PlatoonMember(Node):
         self,
         name: str,
         role: str,
-        pid: PID,
+        slow_pid: PID,
+        mid_pid: PID,
+        fast_pid: PID,
         desired_time_headway: float = 0.5,
         min_spacing: float = 5.0,
         K_dist: float = 0.2,
@@ -47,7 +49,9 @@ class PlatoonMember(Node):
         # and micro-ROS firmware topic scheme.
         self._name = name
         self._role = role
-        self._pid = pid
+        self._slow_pid = slow_pid
+        self._mid_pid = mid_pid
+        self._fast_pid = fast_pid
         self._desired_time_headway = desired_time_headway
         self._min_spacing = min_spacing
         self._K_dist = K_dist
@@ -297,7 +301,7 @@ class PlatoonMember(Node):
             except Exception:
                 pass
 
-        u = self._pid.step(speed_sp, speed_meas)
+        u = self._slow_pid.step(speed_sp, speed_meas)
 
         if u > 0.0:
             throttle = float(u)
