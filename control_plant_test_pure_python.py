@@ -6,16 +6,22 @@ from PID import PID
 
 # Simulation / sampling
 Ts = 0.01
-T_sim = 160
+T_sim = 360
 N_steps = int(T_sim / Ts)
 
 # Real plant with delay (same as in pso_pid_tuning.py)
 s = ctl.TransferFunction.s
-
-G0 = (8.7129*s + 0.05263) / (s**2 + 0.1953*s + 0.0001874) 
+z = ctl.TransferFunction.z
+#G0 = 7.841 / (s + 0.3321) # Low speed range
+#G0 = (56.37*s**2 + 155.6*s + 2.604) / (s**3 + 15.58*s**2 + 2.633*s + 0.08517) # middle range
+G0 = ctl.TransferFunction([0,45.5849,23.7842,0.5994],
+                          [1.0000, 2.4052, 0.2322, 0.0144])
 Gd = ctl.c2d(G0, Ts, method='tustin')
 
-print(f"Gd: {Gd}")
+print(f"G0: {G0}")
+print(f"Zeros: {G0.zeros()}")
+print(f"Poles: {G0.poles()}")
+print(f"DC Gain: {G0.dcgain()}")
 
 # Convert to discrete state-space
 Ad, Bd, Cd, Dd = ctl.ssdata(ctl.ss(Gd))
@@ -25,10 +31,10 @@ Cd = np.asarray(Cd)
 Dd = np.asarray(Dd).reshape(-1)
 
 # PID gains (from PSO)
-kp = 2.59397071e-01
-ki = 1.27381733e-01
-kd = 6.21160744e-03
-N_d = 5.0
+kp =   0.07619123
+ki =   0.00952621
+kd =   0.0
+N_d =  6.27890559
 kb_aw = 1.0
 u_min, u_max = 0.0, 1.0   # throttle 0–1
 
@@ -58,12 +64,21 @@ r[time >= 150.0] = 20.00
 '''
 
 # Standard step change test
-r[time >= 0.0] = 33.33
-r[time >= 60.0] = 0.0
+
+#r[time >= 0.0] = 0.0
+#r[time >= 50.0] = 5.0
+#r[time >= 100.0] = 0.0
+#r[time >= 150.0] = 27.222
+#r[time >= 200.0] = 27.222 + 5.0
+#r[time >= 250.0] = 27.222
 
 
 y = np.zeros_like(time)
 u = np.zeros_like(time)
+u[time >= 0.0] = 0.7
+u[time >= 100.0] = 0.6
+u[time >= 200.0] = 0.7
+u[time >= 250.0] = 0.0
 
 meas_noise_std = 0.05
 
@@ -78,7 +93,7 @@ for k in range(N_steps):
     y_meas += np.random.normal(0.0, meas_noise_std)
 
 
-    u[k] = pid.step(r[k], y_meas)
+    #u[k] = pid.step(r[k], y_meas)
 
 
     x = Ad @ x + Bd * u[k]
