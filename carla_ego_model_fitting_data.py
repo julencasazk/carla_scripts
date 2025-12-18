@@ -143,19 +143,24 @@ def main(args, img_queue, char_queue, img_lock):
     imu.listen(imu_cb)
     cam.listen(cam_cb)
 
-    # CSV File for logging params
-    csv_filename = args.f 
-    csv_file = open(csv_filename, mode="w", newline="")
-    csv_writer = csv.writer(csv_file)
-    # Header 
-    csv_writer.writerow([
-        "time_s",
-        "throttle",
-        "brake",
-        "speed",
-        "accel"
-    ])
-    csv_file.flush()
+    # CSV Files for logging: one per speed range test
+    csv_filename_root = args.f
+    csv_files = []
+    csv_writers = []
+    for i in range(3):
+        fname = f"{csv_filename_root}_range{i+1}.csv"
+        f = open(fname, mode="w", newline="")
+        w = csv.writer(f)
+        w.writerow([
+            "time_s",
+            "throttle",
+            "brake",
+            "speed",
+            "accel",
+        ])
+        f.flush()
+        csv_files.append(f)
+        csv_writers.append(w)
 
     # Step test definition
     dt = settings.fixed_delta_seconds
@@ -191,26 +196,20 @@ def main(args, img_queue, char_queue, img_lock):
         i = end
     '''
     print(f"Running step test: dt={dt}s, total_time={total_time}s")
-    print(f"Logging to: {csv_filename}")
+    print(f"Logging to: {csv_filename_root}_range[1-3].csv")
 
     teleport_time = int(5.0 / dt)  # interval in steps
-    # For doing controlled tests (no random throttle)
-    # throttle_vals = [1.0, 0.0, 0.75, 0.0, 0.5, 0.0, 0.25, 0.0]
-    throttle_vals = [0.0,
-                     0.8,
-                     0.0,
-                     0.5,
-                     0.4,
-                     0.7,
-                     0.75,
-                     0.2,
-                     0.0,
-                     0.1,
-                     0.45,
-                     0.3,
-                     0.8,
-                     0.0]
-    idx = 0
+    # For doing controlled tests around approximate steady speeds.
+    # Each sub-array corresponds to one speed range. The first value is
+    # the base throttle that approximately produces the range's "middle"
+    # speed. The remaining values are test throttles to apply once the
+    # vehicle has reached a stable speed in that range.
+    throttle_vals = [
+        [0.7, 0.75, 0.7, 0.63, 0.75, 0.63, 0.7],
+        [0.55, 0.65, 0.55, 0.45, 0.65, 0.45, 0.55],
+        [0.35, 0.45, 0.35, 0.0, 0.45, 0.0, 0.35],
+    ]
+
     finished = False
     
     try:
@@ -218,16 +217,23 @@ def main(args, img_queue, char_queue, img_lock):
         sim_time = 0.0
         start_timestamp = None
         step = 0
-        # Wait the car to stabilize before doing a setpoint
-        stable_step = 0        
-        prev_speed = 0.0
-
-        last_change_step = 0
-        last_change_speed = 0.0
+        # Test sequencing across ranges
+        current_range = 0
         throttle_cmd = 0.0
-        band = 0.2                      # stable band value of +- <band> m/s
-                                        # speed is stable if inside band for <min_wait_steps> steps 
-        min_wait_steps = int(2.0 / dt)  # secons between stability checks 
+
+        # Stability detection for reaching the approximate steady speed
+        band = 0.2                      # m/s band for "stable" speed
+        stable_time_s = 4.0
+        stable_steps_required = int(stable_time_s / dt)
+        stable_steps = 0
+        last_speed_for_stability = 0.0
+
+        # Test phase timing for each throttle in the pattern
+        dwell_time_s = 20.0 # Might be too long, ill see
+        dwell_steps = int(dwell_time_s / dt)
+        dwell_counter = 0
+        pattern_index = 0
+        in_test_phase = False
 
         # Vehicle reset 
         vehicle.apply_control(carla.VehicleControl(throttle=0.0, brake=0.0))
@@ -270,21 +276,57 @@ def main(args, img_queue, char_queue, img_lock):
             
             speed = math.sqrt(vel.x**2 + vel.y**2)
 
-            # Check if enough time has passed since last change
-            if (step - last_change_step) >= min_wait_steps:
-                # Has speed settled near last_change_speed?
-                if abs(speed - last_change_speed) <= band:
-                    # throttle_cmd = float(np.random.rand())
-                    throttle_cmd = throttle_vals[idx]
-                    if idx == (len(throttle_vals) - 1):
-                        finished = True
-                    idx = (idx+1) % len(throttle_vals)
-                    print(f"Throttle change to {throttle_cmd:.3f} at t={sim_time:.2f}s "
-                          f"(speed: d{speed:.2f} m/s)")
-                last_change_step = step
-                last_change_speed = speed
+            # If we've completed all ranges, stop the test
+            if current_range >= len(throttle_vals):
+                finished = True
 
-            print(f"Current throttle: {throttle_cmd:.3f}")
+            if not finished:
+                base_throttle = throttle_vals[current_range][0]
+                pattern = throttle_vals[current_range][1:]
+
+                if not in_test_phase:
+                    # Approach phase: hold base_throttle until speed is
+                    # stable within a small band for a given time.
+                    throttle_cmd = base_throttle
+
+                    if abs(speed - last_speed_for_stability) <= band:
+                        stable_steps += 1
+                    else:
+                        last_speed_for_stability = speed
+                        stable_steps = 0
+
+                    if stable_steps >= stable_steps_required:
+                        in_test_phase = True
+                        pattern_index = 0
+                        dwell_counter = 0
+                        print(
+                            f"Range {current_range+1}: speed stabilized at "
+                            f"{speed*3.6:.1f} km/h, starting test phase."
+                        )
+                else:
+                    # Test phase: cycle through the throttle pattern for
+                    # this range. Each value is held for dwell_time_s.
+                    if pattern:
+                        throttle_cmd = pattern[pattern_index]
+                    else:
+                        throttle_cmd = base_throttle
+
+                    dwell_counter += 1
+                    if dwell_counter >= dwell_steps:
+                        dwell_counter = 0
+                        pattern_index += 1
+                        if pattern_index >= len(pattern):
+                            # Finished this range; advance to next
+                            current_range += 1
+                            in_test_phase = False
+                            stable_steps = 0
+                            last_speed_for_stability = speed
+                            print(
+                                f"Completed test for range {current_range} at "
+                                f"t={sim_time:.2f}s, speed={speed*3.6:.1f} km/h"
+                            )
+
+            print(f"Current throttle: {throttle_cmd:.3f} (range {current_range+1 if not finished else 'done'})")
 
             control = carla.VehicleControl(
                 throttle=float(throttle_cmd),
@@ -295,14 +337,17 @@ def main(args, img_queue, char_queue, img_lock):
             )
             vehicle.apply_control(control)
 
-            csv_writer.writerow([
-                f"{sim_time:.4f}",
-                f"{throttle_cmd:.4f}",
-                f"{brake_cmd:.4f}",
-                f"{speed:.4f}",
-                f"{accel:.4f}"
-            ])
-            csv_file.flush()
+            # Log only during the test phase for the current range
+            if (not finished) and in_test_phase and current_range < len(csv_writers):
+                writer = csv_writers[current_range]
+                writer.writerow([
+                    f"{sim_time:.4f}",
+                    f"{throttle_cmd:.4f}",
+                    f"{brake_cmd:.4f}",
+                    f"{speed:.4f}",
+                    f"{accel:.4f}",
+                ])
+                csv_files[current_range].flush()
             print(f"Step {step}/{total_steps}")
             print(f"Elapsed time: {sim_time}/{total_time}")
 
@@ -330,7 +375,11 @@ def main(args, img_queue, char_queue, img_lock):
         except:
             pass
 
-        csv_file.close()
+        for f in csv_files:
+            try:
+                f.close()
+            except Exception:
+                pass
 
         print("Done cleanup.")
 
