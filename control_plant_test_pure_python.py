@@ -4,20 +4,23 @@ import control as ctl
 from PID import PID
 
 
+RANGE = "high"
+
+
 # Simulation / sampling
 Ts = 0.01
 T_sim = 360
 N_steps = int(T_sim / Ts)
 
-# Real plant with delay (same as in pso_pid_tuning.py)
-s = ctl.TransferFunction.s
-z = ctl.TransferFunction.z
-#G0 = 7.841 / (s + 0.3321) # Low speed range
-#G0 = (56.37*s**2 + 155.6*s + 2.604) / (s**3 + 15.58*s**2 + 2.633*s + 0.08517) # middle range
-G0 = ctl.TransferFunction([0,45.5849,23.7842,0.5994],
-                          [1.0000, 2.4052, 0.2322, 0.0144])
-Gd = ctl.c2d(G0, Ts, method='tustin')
-
+# Plants for each range, only leave one uncommented, obviously
+if (RANGE == "low"):
+    G0 = ctl.TransferFunction([0, 7.8409],[1.0000, 0.3321]) # Low speed range
+elif (RANGE == "mid"):
+    G0 = ctl.TransferFunction([0, 56.3703, 155.5811, 2.6035],[1.0000, 15.5755, 2.6333, 0.0852]) # middle range
+else:
+    G0 = ctl.TransferFunction([0.0751,0.0010,   -0.0741],[1.0000,   -1.9870,    0.9871], Ts) # High speed range
+#Gd = ctl.c2d(G0, Ts, method='tustin')
+Gd = G0
 print(f"G0: {G0}")
 print(f"Zeros: {G0.zeros()}")
 print(f"Poles: {G0.poles()}")
@@ -30,16 +33,30 @@ Bd = np.asarray(Bd).reshape(-1)
 Cd = np.asarray(Cd)
 Dd = np.asarray(Dd).reshape(-1)
 
-# PID gains (from PSO)
-kp =   0.07619123
-ki =   0.00952621
-kd =   0.0
-N_d =  6.27890559
-kb_aw = 1.0
 u_min, u_max = 0.0, 1.0   # throttle 0–1
+kb_aw = 1.0
 
+if (RANGE == "low"):
+    # Low speed range PID
+    kp =   0.31919206
+    ki =   0.24294889 
+    kd =   0.01506719
+    N_d =  15.0
+elif (RANGE == "mid"):
+    # Mid speed range PID
+    kp =   0.17077964
+    ki =   0.085938
+    kd =   0.0
+    N_d =   5.53169821
+else:
+    # High speed range PID
+    kp =   0.57619798
+    ki =   0.05383481
+    kd =   0.13576069
+    N_d =  14.00557397
 
 pid = PID(kp, ki, kd, N_d, Ts, u_min, u_max, kb_aw, der_on_meas=True)
+
 
 # Time and reference
 time = np.arange(N_steps + 1) * Ts   # store y[0..N_steps]
@@ -63,22 +80,39 @@ r[time >= 135.0] = 0.00
 r[time >= 150.0] = 20.00
 '''
 
-# Standard step change test
+# 
+if (RANGE == "low"):
+    bot = 0.0
+    top = 11.11111 
+elif (RANGE == "mid"):
+    bot = 11.11111 
+    top = 22.22222 
+else:
+    bot = 22.22222
+    top = 33.33333 
+mid = ((top - bot) / 2.0) + bot
 
-#r[time >= 0.0] = 0.0
-#r[time >= 50.0] = 5.0
-#r[time >= 100.0] = 0.0
-#r[time >= 150.0] = 27.222
-#r[time >= 200.0] = 27.222 + 5.0
-#r[time >= 250.0] = 27.222
+r[time >= 0.0] = bot
+r[time >= 50.0] = mid
+r[time >= 100.0] = top
+r[time >= 150.0] = mid
+r[time >= 200.0] = bot
+r[time >= 250.0] = top
+r[time >= 300.0] = bot
+
+u_raw = np.zeros_like(time)
+u_raw[time >= 0.0] = 0.63
+u_raw[time >= 50.0] = 0.68
+u_raw[time >= 100.0] = 0.75
+u_raw[time >= 150.0] = 0.68
+u_raw[time >= 200.0] = 0.63
+u_raw[time >= 250.0] = 0.75
+u_raw[time >= 300.0] = 0.63
 
 
 y = np.zeros_like(time)
 u = np.zeros_like(time)
-u[time >= 0.0] = 0.7
-u[time >= 100.0] = 0.6
-u[time >= 200.0] = 0.7
-u[time >= 250.0] = 0.0
+
 
 meas_noise_std = 0.05
 
@@ -94,7 +128,7 @@ for k in range(N_steps):
 
 
     #u[k] = pid.step(r[k], y_meas)
-
+    u[k] = u_raw[k]
 
     x = Ad @ x + Bd * u[k]
     y[k+1] = (Cd @ x + Dd * u[k]).item()
