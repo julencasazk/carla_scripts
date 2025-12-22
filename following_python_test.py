@@ -13,6 +13,44 @@ import control as ctl
 from PID import PID
 from Platooning import Platoon, PlatoonMember
 
+def lane_keep_steer(
+    vehicle: carla.Vehicle,
+    carla_map: carla.Map,
+    lookahead_m: float = 12.0,
+    steer_gain: float = 1.0,
+    wheelbase_m: float = 2.8,
+) -> float:
+    """
+    Simple lane-keeping steering using a pure-pursuit style lookahead waypoint.
+    Returns normalized steer in [-1, 1].
+    """
+    tf = vehicle.get_transform()
+    wp = carla_map.get_waypoint(
+        tf.location, project_to_road=True, lane_type=carla.LaneType.Driving
+    )
+    if wp is None:
+        return 0.0
+
+    next_wps = wp.next(max(1.0, float(lookahead_m)))
+    if not next_wps:
+        return 0.0
+
+    target = next_wps[0].transform.location
+    vec = target - tf.location
+
+    forward = tf.get_forward_vector()
+    right = tf.get_right_vector()
+    x = vec.x * forward.x + vec.y * forward.y + vec.z * forward.z
+    y = vec.x * right.x + vec.y * right.y + vec.z * right.z
+
+    if x <= 1e-3:
+        return 0.0
+
+    curvature = (2.0 * y) / (x * x + y * y)
+    steer_angle = math.atan(wheelbase_m * curvature)
+    steer = float(np.clip(steer_gain * steer_angle, -1.0, 1.0))
+    return steer
+
 #####################################
 # Dashcam process 
 #####################################
@@ -66,12 +104,13 @@ def main(args, img_queue, char_queue, img_lock):
     Ts = 0.01
 
     # PID gains
-    kp = 2.59397071e-01
-    ki = 1.27381733e-01
-    kd = 6.21160744e-03
-    N_d = 5.0
+    u_min = -1.0
+    u_max = 1.0
     kb_aw = 1.0
-    u_min, u_max = -1.0, 1.0
+
+    pid_low  = PID(0.43127789, 0.43676547, 0.0, 15.0, Ts, u_min, u_max, kb_aw, der_on_meas=True)
+    pid_mid  = PID(0.11675119, 0.085938,   0.0, 14.90530836, Ts, u_min, u_max, kb_aw, der_on_meas=True)
+    pid_high = PID(0.13408096, 0.07281374,  0.0, 12.16810135, Ts, u_min, u_max, kb_aw, der_on_meas=True)
 
     latest_frame = None
     frame_lock = threading.Lock()
@@ -82,6 +121,7 @@ def main(args, img_queue, char_queue, img_lock):
     client.load_world('Town04')
     time.sleep(2.0)
     world = client.get_world()
+    carla_map = world.get_map()
     bp_library = world.get_blueprint_library()
 
     original_settings = world.get_settings()
@@ -100,11 +140,11 @@ def main(args, img_queue, char_queue, img_lock):
     members = []
     vehicles = []
 
-    base_spawn_point = spawn_points[54]
-    base_spawn_point.location.z -= 0.3
+    base_spawn_point = spawn_points[125]
+    base_spawn_point.location.y -= 60.0 # put the leader further ahead to let the followers have space to spawn
 
     # Distance between vehicles in spawn (just so they don't collide at start)
-    initial_spacing = 10.0
+    initial_spacing = 6.0
 
     vehicle_bp = bp_library.find('vehicle.tesla.model3')
 
@@ -112,8 +152,8 @@ def main(args, img_queue, char_queue, img_lock):
         # Leader is i == 0, followers i > 0 placed behind it
         spawn_tf = carla.Transform(
             location=carla.Location(
-                x=base_spawn_point.location.x + i * initial_spacing,
-                y=base_spawn_point.location.y,
+                x=base_spawn_point.location.x,
+                y=base_spawn_point.location.y + i * initial_spacing,
                 z=base_spawn_point.location.z
             ),
             rotation=base_spawn_point.rotation
@@ -125,16 +165,14 @@ def main(args, img_queue, char_queue, img_lock):
         role = "lead" if i == 0 else "follower"
         name = "lead" if i == 0 else f"ego_{i}"
 
-        pid = PID(kp, ki, kd, N_d, Ts, u_min, u_max, kb_aw, der_on_meas=True)
-
         member = PlatoonMember(
             name=name,
             role=role,
             vehicle=veh,
-            pid=pid,
+            pid=None,
             desired_time_headway=0.7 if (i == 1) else 0.3, # First follower mantain a safer distance to lead
-            min_spacing=5.0,
-            K_dist=0.3,
+            min_spacing=7.5,
+            K_dist=5,
         )
         members.append(member)
         print(f"Spawned {veh.type_id} as {role} at {spawn_tf}")
@@ -159,7 +197,8 @@ def main(args, img_queue, char_queue, img_lock):
     cam_bp.set_attribute('image_size_y', '480')
     cam_bp.set_attribute('fov', '90')
 
-    cam_transform = carla.Transform(carla.Location(x=0.0, y=10.0, z=10.0), carla.Rotation(yaw=-20.0, pitch=-35))
+    cam_transform = carla.Transform(carla.Location(x=-10.0, y=0.0, z=10.0), carla.Rotation(yaw=-0.0, pitch=-35)) # transform positions seem to be relative when attached
+
     cam = world.spawn_actor(cam_bp, cam_transform, attach_to=ego_vehicle)
     print(f"Spawned {cam.type_id}")
 
@@ -205,7 +244,9 @@ def main(args, img_queue, char_queue, img_lock):
     dt = settings.fixed_delta_seconds
     total_time = 3600.0
     total_steps = int(total_time / dt)
-    teleport_time = int(5.0 / dt)
+    teleport_dist_m = float(args.teleport_dist)
+    dist_since_tp_m = 0.0
+    last_lead_loc = None
 
     # Lead speed setpoints (m/s)
     lead_speed_setpoints = [0.0, 33.0, 0.0, 20.0, 25.0, 15.0, 10.0, 5.0, 15.0, 0.0]
@@ -216,6 +257,7 @@ def main(args, img_queue, char_queue, img_lock):
         sim_time = 0.0
         start_timestamp = None
         step = 0
+        last_tick_wall_s = None
 
         last_change_step = 0
         last_change_speed = 0.0
@@ -227,7 +269,23 @@ def main(args, img_queue, char_queue, img_lock):
             v.apply_control(carla.VehicleControl(throttle=0.0, brake=0.0))
 
         while not finished:
+            # Pace synchronous ticks to real-time (never faster than `dt` wall-time).
+            # This is useful when the rest of the system (e.g. microcontroller) runs at a fixed rate.
+            if last_tick_wall_s is not None:
+                next_tick_wall_s = last_tick_wall_s + dt
+                now_s = time.perf_counter()
+                if now_s < next_tick_wall_s:
+                    time.sleep(next_tick_wall_s - now_s)
+
             world.tick()
+            tick_wall_s = time.perf_counter()
+            if last_tick_wall_s is not None:
+                print(
+                    f"Wall dt between ticks: {tick_wall_s - last_tick_wall_s:.6f}s "
+                    f"(target >= {dt:.6f}s)"
+                )
+            last_tick_wall_s = tick_wall_s
+
             snapshot = world.get_snapshot()
             t = snapshot.timestamp.elapsed_seconds
             if start_timestamp is None:
@@ -237,8 +295,19 @@ def main(args, img_queue, char_queue, img_lock):
             if sim_time >= total_time:
                 finished = True
 
-            # Teleport whole platoon every 5 s (keep relative positions)
-            if step > 0 and step % teleport_time == 0:
+            # Distance-based teleport: when leader has traveled N meters, teleport whole platoon (keep relative positions)
+            lead_loc = lead_vehicle.get_transform().location
+            if last_lead_loc is None:
+                last_lead_loc = lead_loc
+            else:
+                dist_since_tp_m += math.dist(
+                    (lead_loc.x, lead_loc.y, lead_loc.z),
+                    (last_lead_loc.x, last_lead_loc.y, last_lead_loc.z),
+                )
+                last_lead_loc = lead_loc
+
+            if teleport_dist_m > 0.0 and dist_since_tp_m >= teleport_dist_m:
+                print(f"Teleport triggered: leader traveled {dist_since_tp_m:.2f} m (threshold {teleport_dist_m:.2f} m)")
                 lead_tf = lead_vehicle.get_transform()
                 base_tf = base_spawn_point
 
@@ -273,12 +342,25 @@ def main(args, img_queue, char_queue, img_lock):
                     m.vehicle.set_transform(new_tf)
 
                 print("Teleport with spawn snapping!!")
+                dist_since_tp_m = 0.0
+                last_lead_loc = lead_vehicle.get_transform().location
 
             # Decide global lead speed setpoint
             global_lead_speed_sp = lead_speed_setpoints[lead_sp_idx]
 
             # Update platoon
             states, controls = platoon.update(dt=dt, global_lead_speed_sp=global_lead_speed_sp)
+
+            # Optional: add lane-keeping steering while keeping longitudinal (throttle/brake)
+            if args.lane_keep:
+                for m, ctrl in zip(platoon.members, controls):
+                    ctrl.steer = lane_keep_steer(
+                        m.vehicle,
+                        carla_map,
+                        lookahead_m=args.lane_lookahead,
+                        steer_gain=args.lane_gain,
+                    )
+                    m.vehicle.apply_control(ctrl)
 
             # Unpack leader/ego info for logging (only if there is a follower)
             lead_speed, lead_accel_abs, lead_tf = states[0]
@@ -324,7 +406,7 @@ def main(args, img_queue, char_queue, img_lock):
                     last_change_speed = ego_speed
 
             # Logging
-            print(f"t={sim_time:.2f}s")
+            print(f"t={sim_time:.2f}s  leader_dist_since_tp={dist_since_tp_m:.2f} m")
             print(
                 f"  Lead:  SP={global_lead_speed_sp:.2f} v={lead_speed:.2f} "
                 f"Th={lead_ctrl.throttle:.3f} Br={lead_ctrl.brake:.3f}"
@@ -370,6 +452,10 @@ def main(args, img_queue, char_queue, img_lock):
             cam.stop()
         except:
             pass
+        try:
+            world.apply_settings(original_settings)
+        except:
+            pass
         for v in vehicles:
             try:
                 v.destroy()
@@ -398,6 +484,19 @@ if __name__ == "__main__":
     parser.add_argument('--port', type=int, help="CARLA port", default=2000)
     parser.add_argument('-f', type=str, help="Output csv filename", default="out.csv")
     parser.add_argument('--plen', type=int, default=2, help="Number of platoon members, minimum one (leader)")
+    parser.add_argument(
+        '--teleport-dist',
+        type=float,
+        default=250.0,
+        help="Teleport the platoon back when the leader has traveled this distance in meters; set <= 0 to disable.",
+    )
+    parser.add_argument(
+        '--lane-keep',
+        action='store_true',
+        help="Enable simple lane-keeping steering (pure pursuit) while keeping longitudinal control from this script.",
+    )
+    parser.add_argument('--lane-lookahead', type=float, default=12.0, help="Lane-keeping lookahead distance in meters.")
+    parser.add_argument('--lane-gain', type=float, default=1.0, help="Lane-keeping steering gain.")
     args = parser.parse_args()
 
     img_lock = multiprocessing.Lock()
