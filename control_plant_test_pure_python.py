@@ -4,27 +4,45 @@ import control as ctl
 from PID import PID
 
 
-RANGE = "high"
+RANGE = "low"
 
+# -----------------------------
+# User-defined operating point
+# -----------------------------
+if (RANGE == "low"):
+    u0 = 0.35   
+    v0 = 7.77777
+elif (RANGE == "mid"):
+    u0 = 0.55
+    v0 = 16.666666
+else:
+    u0=0.68
+    v0 = 27.7777
+       
 
 # Simulation / sampling
 Ts = 0.01
 T_sim = 360
 N_steps = int(T_sim / Ts)
 
-# Plants for each range, only leave one uncommented, obviously
-if (RANGE == "low"):
-    G0 = ctl.TransferFunction([0, 7.8409],[1.0000, 0.3321]) # Low speed range
-elif (RANGE == "mid"):
-    G0 = ctl.TransferFunction([0, 56.3703, 155.5811, 2.6035],[1.0000, 15.5755, 2.6333, 0.0852]) # middle range
+# Plants for each range
+if RANGE == "low":
+    G0 = ctl.TransferFunction([0, 8.5777, 54.0770], # Low speeds
+                              [1.0000, 7.0533, 2.1718])
+elif RANGE == "mid":
+    G0 = ctl.TransferFunction([0,   12.3082,   67.2242],
+                              [1.0000,    5.2957,    1.0404]) 
 else:
-    G0 = ctl.TransferFunction([0.0751,0.0010,   -0.0741],[1.0000,   -1.9870,    0.9871], Ts) # High speed range
-#Gd = ctl.c2d(G0, Ts, method='tustin')
-Gd = G0
-print(f"G0: {G0}")
-print(f"Zeros: {G0.zeros()}")
-print(f"Poles: {G0.poles()}")
-print(f"DC Gain: {G0.dcgain()}")
+    G0 = ctl.TransferFunction([ 0,15.0224,   20.4896],
+                              [1.0000,    1.3026,    0.1813])
+
+# Ensure discrete plant at Ts
+Gd = G0 if G0.dt not in (None, 0) else ctl.c2d(G0, Ts, method='tustin')
+
+print(f"Gd: {Gd}")
+print(f"Zeros: {Gd.zeros()}")
+print(f"Poles: {Gd.poles()}")
+print(f"DC Gain: {Gd.dcgain()}")
 
 # Convert to discrete state-space
 Ad, Bd, Cd, Dd = ctl.ssdata(ctl.ss(Gd))
@@ -33,63 +51,29 @@ Bd = np.asarray(Bd).reshape(-1)
 Cd = np.asarray(Cd)
 Dd = np.asarray(Dd).reshape(-1)
 
-u_min, u_max = 0.0, 1.0   # throttle 0–1
+u_min, u_max = 0.0, 1.0
 kb_aw = 1.0
 
-if (RANGE == "low"):
-    # Low speed range PID
-    kp =   0.31919206
-    ki =   0.24294889 
-    kd =   0.01506719
-    N_d =  15.0
-elif (RANGE == "mid"):
-    # Mid speed range PID
-    kp =   0.17077964
-    ki =   0.085938
-    kd =   0.0
-    N_d =   5.53169821
+# PID params
+if RANGE == "low":
+    kp, ki, kd, N_d =  0.43127789,  0.43676547,  0.0,     14.64609183
+elif RANGE == "mid":
+    kp, ki, kd, N_d =  0.11675119, 0.0514106, 0.0, 14.90530836
 else:
-    # High speed range PID
-    kp =   0.57619798
-    ki =   0.05383481
-    kd =   0.13576069
-    N_d =  14.00557397
+    kp, ki, kd, N_d =  0.13408096 , 0.07281374 , 0.0, 12.16810135
 
 pid = PID(kp, ki, kd, N_d, Ts, u_min, u_max, kb_aw, der_on_meas=True)
 
-
 # Time and reference
-time = np.arange(N_steps + 1) * Ts   # store y[0..N_steps]
+time = np.arange(N_steps + 1) * Ts
 r = np.zeros_like(time)
-'''
-# Small changes test
-#   for checking robustness
-r[time >= 0.0] = 33.33 
-r[time >= 15.0] = 32.00
-r[time >= 30.0] = 33.33 
 
-r[time >= 45.0] = 15.00
-r[time >= 60.0] = 14.00
-r[time >= 75.0] = 16.00
-
-r[time >= 90.0] = 5.00
-r[time >= 105.0] = 4.00
-r[time >= 120.0] = 6.00
-
-r[time >= 135.0] = 0.00
-r[time >= 150.0] = 20.00
-'''
-
-# 
-if (RANGE == "low"):
-    bot = 0.0
-    top = 11.11111 
-elif (RANGE == "mid"):
-    bot = 11.11111 
-    top = 22.22222 
+if RANGE == "low":
+    bot, top = 0.0, 11.11111
+elif RANGE == "mid":
+    bot, top = 11.11111, 22.22222
 else:
-    bot = 22.22222
-    top = 33.33333 
+    bot, top = 22.22222, 33.33333
 mid = ((top - bot) / 2.0) + bot
 
 r[time >= 0.0] = bot
@@ -100,52 +84,65 @@ r[time >= 200.0] = bot
 r[time >= 250.0] = top
 r[time >= 300.0] = bot
 
-u_raw = np.zeros_like(time)
-u_raw[time >= 0.0] = 0.63
-u_raw[time >= 50.0] = 0.68
-u_raw[time >= 100.0] = 0.75
-u_raw[time >= 150.0] = 0.68
-u_raw[time >= 200.0] = 0.63
-u_raw[time >= 250.0] = 0.75
-u_raw[time >= 300.0] = 0.63
+# Absolute throttle profile (as before)
+u_raw = np.full_like(time, 0.7)
+u_raw[time >= 30]  = 0.75
+u_raw[time >= 80]  = 0.7
+u_raw[time >= 130] = 0.63
+u_raw[time >= 180] = 0.75
+u_raw[time >= 230] = 0.63
+u_raw[time >= 280] = 0.7
+u_raw[time >= 350] = 0
 
+# -----------------------------
+# Incremental I/O construction
+# -----------------------------
+du = u_raw - u0            # model input is Δu
+dv = np.zeros_like(time)   # model output is Δv (what we simulate)
 
-y = np.zeros_like(time)
-u = np.zeros_like(time)
+# Optional: if you want an incremental reference for a controller
+# dr = r - v0
 
+u = np.zeros_like(time)    # will store absolute throttle actually applied (for plotting)
+y = np.zeros_like(time)    # will store absolute speed reconstructed (for plotting)
 
 meas_noise_std = 0.05
 
-# Initial plant state
+# Initial plant state (incremental state)
 x = np.zeros(Ad.shape[0])
 
 for k in range(N_steps):
+    # Current absolute output is reconstructed from dv
+    y[k] = v0 + dv[k]
 
-    y_meas = y[k]
+    # Measurement noise on absolute measurement (if you use PID)
+    y_meas = y[k] + np.random.normal(0.0, meas_noise_std)
+
+    # If using PID, it should act on absolute (r, y_meas) but drive incremental plant:
+    du_cmd = pid.step(r[k], y_meas) - u0
+    du[k] = du_cmd
+    u[k] = np.clip(u0 + du[k], u_min, u_max)
     
-    # Gaussian measurement noise
-    y_meas += np.random.normal(0.0, meas_noise_std)
+    du_k = u[k] - u0
 
+    # Incremental plant update (Δu -> Δv)
+    x = Ad @ x + Bd * du_k
+    dv[k + 1] = (Cd @ x + Dd * du_k).item()
 
-    #u[k] = pid.step(r[k], y_meas)
-    u[k] = u_raw[k]
-
-    x = Ad @ x + Bd * u[k]
-    y[k+1] = (Cd @ x + Dd * u[k]).item()
-
-
+# Fill last samples for plotting
 u[-1] = u[-2]
+y[-1] = v0 + dv[-1]
 
 plt.figure(figsize=(10, 6))
 plt.subplot(2, 1, 1)
-plt.plot(time, r, '--', label='r')
-plt.plot(time, y, label='y')
+plt.plot(time, r, '--', label='r (abs)')
+plt.plot(time, y, label='y (abs reconstructed)')
 plt.grid(True)
 plt.legend()
 plt.ylabel('Speed [m/s]')
 
 plt.subplot(2, 1, 2)
-plt.plot(time, u, label='u (throttle)')
+plt.plot(time, u, label='u (abs throttle)')
 plt.grid(True)
 plt.legend()
 plt.xlabel('t [s]')
