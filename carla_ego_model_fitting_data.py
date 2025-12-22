@@ -11,7 +11,7 @@ import os
 import csv
 
 #####################################
-# Dashcam process 
+# Dashcam process
 #####################################
 def dashcam(args, img_queue, char_queue, img_lock):
     time.sleep(5)
@@ -49,7 +49,7 @@ def dashcam(args, img_queue, char_queue, img_lock):
         print("Destroyed all windows")
 
 #####################################
-# Main CARLA process 
+# Main CARLA process
 #####################################
 def main(args, img_queue, char_queue, img_lock):
     print("CARLA longitudinal test with synchronous mode")
@@ -66,7 +66,7 @@ def main(args, img_queue, char_queue, img_lock):
     for m in client.get_available_maps():
         print("  ", m)
 
-    # Town04 has the longest highways strips of any default map 
+    # Town04 has long highways
     client.load_world('Town04')
     time.sleep(2.0)
     world = client.get_world()
@@ -75,21 +75,19 @@ def main(args, img_queue, char_queue, img_lock):
     # Enable synchronous mode with dt=0.01s
     original_settings = world.get_settings()
     settings = world.get_settings()
-    settings.synchronous_mode = True  
-    settings.fixed_delta_seconds = 0.01 # I don't know if it's important right now, 
-                                        # but should match the sampling
-                                        # rate of the PID on the STM32
-    settings.no_rendering_mode = False  # Camera feed is prefered, although not needed
+    settings.synchronous_mode = True
+    settings.fixed_delta_seconds = 0.01
+    settings.no_rendering_mode = False
     settings.substepping = True
     settings.max_substep_delta_time = 0.001
-    settings.max_substeps = 10 # Trying this to hopefully make the physics more reliable
+    settings.max_substeps = 10
     world.apply_settings(settings)
     print("Synchronous mode ON, dt = 0.01 s")
 
     spawn_points = world.get_map().get_spawn_points()
-    
     spawn_point = spawn_points[54]
     spawn_point.location.z -= 0.3
+
     vehicle_bp = bp_library.find('vehicle.tesla.model3')
     vehicle = world.spawn_actor(vehicle_bp, spawn_point)
     print(f"Spawned {vehicle.type_id} at spawn point {spawn_point}")
@@ -126,24 +124,28 @@ def main(args, img_queue, char_queue, img_lock):
 
     imu_bp = bp_library.find('sensor.other.imu')
     imu_bp.set_attribute('sensor_tick', '0.01')
-    # Attach IMU at vehicle origin (sensor frame X will be longitudinal)
     imu_transform = carla.Transform()
     imu = world.spawn_actor(imu_bp, imu_transform, attach_to=vehicle)
     print(f"Spawned {imu.type_id}")
 
     def imu_cb(imu_data):
         nonlocal imu_accel_x
-        # IMU accelerometer is in sensor frame (m/s^2)
         with imu_lock:
             imu_accel_x = float(imu_data.accelerometer.x)
 
     os.makedirs("spawn_point_imgs", exist_ok=True)
 
-
     imu.listen(imu_cb)
     cam.listen(cam_cb)
 
-    # CSV Files for logging: one per speed range test
+    # ---------- PRBS helpers ----------
+    def prbs_bit(rng):
+        return 1 if rng.integers(0, 2) == 1 else -1
+
+    def clamp(x, lo, hi):
+        return lo if x < lo else (hi if x > hi else x)
+
+    # ---------- CSV logging ----------
     csv_filename_root = args.f
     csv_files = []
     csv_writers = []
@@ -151,142 +153,106 @@ def main(args, img_queue, char_queue, img_lock):
         fname = f"{csv_filename_root}_range{i+1}.csv"
         f = open(fname, mode="w", newline="")
         w = csv.writer(f)
-        w.writerow([
-            "time_s",
-            "throttle",
-            "brake",
-            "speed",
-            "accel",
-        ])
+        w.writerow(["time_s", "throttle", "brake", "speed", "accel"])
         f.flush()
         csv_files.append(f)
         csv_writers.append(w)
 
-    # Step test definition
+    # ---------- Test configuration ----------
     dt = settings.fixed_delta_seconds
-    total_time = 3600.0 # Very long time, enough to input all throttle setpoints 
+    total_time = 3600.0
     total_steps = int(total_time / dt)
-    '''
-    min_sec = 10
-    max_sec = 50
-    min_step_btw_sp = int(min_sec / dt)
-    max_step_btw_sp = int(max_sec / dt) 
-    print(f"The test will run for {total_steps} steps...")
-    prev_val = 0.0
-    
-    # Piecewise-constant throttle with random segment lengths in [10 s, 30 s]
-    throttle_sp = np.zeros(total_steps, dtype=float)
-    i = 0
-    while i < total_steps:
-        # Create a random throttle value 
-        throttle_val = float(np.random.rand())  # [0, 1)
-        # The wait between changes is proportional to step change
-        delta = abs(throttle_val - prev_val)
-        dwell_sec = min_sec + (max_sec - min_sec)*delta
-        # How many steps the value is going to be applied to 
-        seg_len = int(dwell_sec / dt) # Floor, makes sure it will not be over the max value
-        # Check if close to end of steps
-        end = min(i + seg_len, total_steps)
-        # Apply throttle value for whole range 
-        throttle_sp[i:end] = throttle_val
-        print(f"Throttle {throttle_val:.3f} from t={i*dt:.2f}s to t={end*dt:.2f}s "
-              f"(~{(end - i)*dt:.2f}s segment)")
-        prev_val = throttle_val
-        # Jump to next 0 value
-        i = end
-    '''
-    print(f"Running step test: dt={dt}s, total_time={total_time}s")
+
+    print(f"Running PRBS test: dt={dt}s, total_time={total_time}s")
     print(f"Logging to: {csv_filename_root}_range[1-3].csv")
 
-    teleport_time = int(5.0 / dt)  # interval in steps
-    # For doing controlled tests around approximate steady speeds.
-    # Each sub-array corresponds to one speed range. The first value is
-    # the base throttle that approximately produces the range's "middle"
-    # speed. The remaining values are test throttles to apply once the
-    # vehicle has reached a stable speed in that range.
-    throttle_vals = [
-        [0.7, 0.75, 0.7, 0.63, 0.75, 0.63, 0.7],
-        [0.55, 0.65, 0.55, 0.45, 0.65, 0.45, 0.55],
-        [0.35, 0.45, 0.35, 0.0, 0.45, 0.0, 0.35],
+    teleport_time = int(7.0 / dt)
+
+    # One dict per speed-range test. u0 is operating point; PRBS is around u0 and clipped.
+    # Adjust these to your desired operating points/ranges.
+    ranges = [
+        {"u0": 0.70, "umin": 0.63, "umax": 0.75, "amp": 0.02},  # high speed range
+        {"u0": 0.55, "umin": 0.45, "umax": 0.65, "amp": 0.02},  # mid speed range
+        {"u0": 0.35, "umin": 0.00, "umax": 0.45, "amp": 0.02},  # low speed range
     ]
 
+    # PRBS chip timing: either fixed or random in [chip_time_min_s, chip_time_max_s]
+    use_random_chip_time = True
+    chip_time_s = 1.0
+    chip_time_min_s = 0.5
+    chip_time_max_s = 2.5
+
+    # Range duration (how long to log PRBS after stabilization)
+    dwell_time_s = 300.0  # recommended 300–600s; increase for better identifiability
+    dwell_steps = int(dwell_time_s / dt)
+
     finished = False
-    
+
     try:
-        # Sim time counter 
         sim_time = 0.0
         start_timestamp = None
         step = 0
-        # Test sequencing across ranges
+
         current_range = 0
         throttle_cmd = 0.0
 
-        # Stability detection for reaching the approximate steady speed
-        band = 0.2                      # m/s band for "stable" speed
+        # Stability detection before starting PRBS logging (speed must be "steady")
+        band = 0.2
         stable_time_s = 4.0
         stable_steps_required = int(stable_time_s / dt)
         stable_steps = 0
         last_speed_for_stability = 0.0
-
-        # Test phase timing for each throttle in the pattern
-        dwell_time_s = 20.0 # Might be too long, ill see
-        dwell_steps = int(dwell_time_s / dt)
-        dwell_counter = 0
-        pattern_index = 0
         in_test_phase = False
 
-        # Vehicle reset 
+        # PRBS state
+        rng = np.random.default_rng(12345)  # reproducible PRBS
+        chip_steps = max(1, int(chip_time_s / dt))
+        chip_counter = 0
+        prbs_state = prbs_bit(rng)
+
+        # Range timing
+        dwell_counter = 0
+
+        # Vehicle reset
         vehicle.apply_control(carla.VehicleControl(throttle=0.0, brake=0.0))
 
-        # Synchronous loop 
-        #while sim_time < total_time:
         while not finished:
-            # Update a single simulation step 
             world.tick()
             snapshot = world.get_snapshot()
-            t = snapshot.timestamp.elapsed_seconds
+            t_now = snapshot.timestamp.elapsed_seconds
             if start_timestamp is None:
-                start_timestamp = t
-            sim_time = t - start_timestamp
-            
-            # If on last step, do the step and finish
+                start_timestamp = t_now
+            sim_time = t_now - start_timestamp
+
             if sim_time >= total_time:
                 finished = True
 
-
-            brake_cmd = 0.0  
-            
-            
-
-            vel = vehicle.get_velocity()
-            # Use IMU X-axis linear acceleration instead of actor acceleration
-            # Uncomment when using IMU instead of Actor acceleration
-            #with imu_lock:
-            #    accel = imu_accel_x
-            
-            # Just checking if physics improved
-            accel = vehicle.get_acceleration().x
-            # end checking
-            
-            # Teleport every 5 seconds to stay in flat segment 
-            # of highway continuously
+            # Teleport every few seconds to stay in flat segment
             if step > 0 and step % teleport_time == 0:
                 vehicle.set_transform(spawn_point)
                 print("Teleport!!")
-            
-            speed = math.sqrt(vel.x**2 + vel.y**2)
 
-            # If we've completed all ranges, stop the test
-            if current_range >= len(throttle_vals):
+            vel = vehicle.get_velocity()
+            speed = math.sqrt(vel.x**2 + vel.y**2)  # m/s
+
+            # Use actor acceleration (you can swap to IMU if preferred)
+            accel = vehicle.get_acceleration().x
+
+            brake_cmd = 0.0
+
+            # Done all ranges?
+            if current_range >= len(ranges):
                 finished = True
 
             if not finished:
-                base_throttle = throttle_vals[current_range][0]
-                pattern = throttle_vals[current_range][1:]
+                cfg = ranges[current_range]
+                base_throttle = float(cfg["u0"])
+                u_min = float(cfg["umin"])
+                u_max = float(cfg["umax"])
+                amp = float(cfg["amp"])
 
                 if not in_test_phase:
-                    # Approach phase: hold base_throttle until speed is
-                    # stable within a small band for a given time.
+                    # Approach phase: hold base_throttle until speed stabilizes
                     throttle_cmd = base_throttle
 
                     if abs(speed - last_speed_for_stability) <= band:
@@ -297,37 +263,47 @@ def main(args, img_queue, char_queue, img_lock):
 
                     if stable_steps >= stable_steps_required:
                         in_test_phase = True
-                        pattern_index = 0
                         dwell_counter = 0
+
+                        chip_counter = 0
+                        prbs_state = prbs_bit(rng)
+                        if use_random_chip_time:
+                            chip_time_s = float(rng.uniform(chip_time_min_s, chip_time_max_s))
+                            chip_steps = max(1, int(chip_time_s / dt))
+
                         print(
                             f"Range {current_range+1}: speed stabilized at "
-                            f"{speed*3.6:.1f} km/h, starting test phase."
+                            f"{speed*3.6:.1f} km/h, starting PRBS test phase "
+                            f"(u0={base_throttle:.3f}, amp=±{amp:.3f}, clamp=[{u_min:.3f},{u_max:.3f}])."
                         )
                 else:
-                    # Test phase: cycle through the throttle pattern for
-                    # this range. Each value is held for dwell_time_s.
-                    if pattern:
-                        throttle_cmd = pattern[pattern_index]
-                    else:
-                        throttle_cmd = base_throttle
+                    # PRBS around base throttle, clipped
+                    u_candidate = base_throttle + amp * prbs_state
+                    throttle_cmd = clamp(u_candidate, u_min, u_max)
 
+                    # Update PRBS chip
+                    chip_counter += 1
+                    if chip_counter >= chip_steps:
+                        chip_counter = 0
+                        prbs_state = prbs_bit(rng)
+
+                        if use_random_chip_time:
+                            chip_time_s = float(rng.uniform(chip_time_min_s, chip_time_max_s))
+                            chip_steps = max(1, int(chip_time_s / dt))
+
+                    # End this range after dwell_time_s
                     dwell_counter += 1
                     if dwell_counter >= dwell_steps:
-                        dwell_counter = 0
-                        pattern_index += 1
-                        if pattern_index >= len(pattern):
-                            # Finished this range; advance to next
-                            current_range += 1
-                            in_test_phase = False
-                            stable_steps = 0
-                            last_speed_for_stability = speed
-                            print(
-                                f"Completed test for range {current_range} at "
-                                f"t={sim_time:.2f}s, speed={speed*3.6:.1f} km/h"
-                            )
+                        current_range += 1
+                        in_test_phase = False
+                        stable_steps = 0
+                        last_speed_for_stability = speed
+                        print(
+                            f"Completed PRBS test for range {current_range} "
+                            f"at t={sim_time:.2f}s, speed={speed*3.6:.1f} km/h"
+                        )
 
-            print(f"Current throttle: {throttle_cmd:.3f} (range {current_range+1 if not finished else 'done'})")
-
+            # Apply control
             control = carla.VehicleControl(
                 throttle=float(throttle_cmd),
                 brake=float(brake_cmd),
@@ -337,7 +313,7 @@ def main(args, img_queue, char_queue, img_lock):
             )
             vehicle.apply_control(control)
 
-            # Log only during the test phase for the current range
+            # Log only during test phase for current range
             if (not finished) and in_test_phase and current_range < len(csv_writers):
                 writer = csv_writers[current_range]
                 writer.writerow([
@@ -348,15 +324,17 @@ def main(args, img_queue, char_queue, img_lock):
                     f"{accel:.4f}",
                 ])
                 csv_files[current_range].flush()
-            print(f"Step {step}/{total_steps}")
-            print(f"Elapsed time: {sim_time}/{total_time}")
 
-            step = step + 1
-            
+            if step % 50 == 0:
+                print(
+                    f"t={sim_time:7.2f}s | range={current_range+1 if not finished else 'done'} "
+                    f"| phase={'PRBS' if in_test_phase else 'approach'} "
+                    f"| u={throttle_cmd:.3f} | v={speed:.2f} m/s"
+                )
 
-        print("Step test finished successfully.")
+            step += 1
 
-        # Stop vehicle when test over
+        print("PRBS test finished successfully.")
         vehicle.apply_control(carla.VehicleControl(throttle=0.0, brake=1.0))
         time.sleep(1.0)
 
@@ -369,7 +347,18 @@ def main(args, img_queue, char_queue, img_lock):
             cam.stop()
         except:
             pass
-
+        try:
+            imu.stop()
+        except:
+            pass
+        try:
+            cam.destroy()
+        except:
+            pass
+        try:
+            imu.destroy()
+        except:
+            pass
         try:
             vehicle.destroy()
         except:
@@ -381,10 +370,16 @@ def main(args, img_queue, char_queue, img_lock):
             except Exception:
                 pass
 
+        # Restore world settings
+        try:
+            world.apply_settings(original_settings)
+        except Exception:
+            pass
+
         print("Done cleanup.")
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="CARLA longitudinal identification test")
+    parser = argparse.ArgumentParser(description="CARLA longitudinal identification test (PRBS)")
     parser.add_argument('--host', type=str, help="CARLA host", default='localhost')
     parser.add_argument('--port', type=int, help="CARLA port", default=2000)
     parser.add_argument('-f', type=str, help="Output csv filename", default="out.csv")
