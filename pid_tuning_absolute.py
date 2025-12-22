@@ -1,19 +1,22 @@
 """
-PSO-based PID tuning with offline normalization of metric scales,
-tuning kp, ki, kd, N (derivative filter).
+PSO-based PID tuning for INCREMENTAL identified plants (Remove Means):
+    Δv = G(z) Δu
+
+This script evaluates PID performance in ABSOLUTE variables:
+    v_abs = v0 + Δv
+    u_abs = clip( PID(r_abs, v_abs_meas), [u_min, u_max] )
+but updates the incremental plant with:
+    Δu = u_abs - u0
 
 Decision variables:
     x = [kp, ki, kd, N]
 
 Metrics:
-    J1: SSE   (steady-state error)
-    J2: OS    (overshoot, %)
-    J3: TsTr  (Ts - Tr, settling minus rise time)
-    J4: RVG   (robustness to gain variation)
-    J5: ODJ   (output disturbance rejection)
-    J6: u_rms (RMS control effort)
-    J7: du_rms (RMS control rate)
-    J8: sat_ratio (fraction of time at upper saturation)
+    SSE, OS, TsTr, RVG, ODJ, u_rms, du_rms, sat_ratio
+
+IMPORTANT:
+- Provide correct operating points (u0, v0) for the speed range.
+- Provide Gd as the INCREMENTAL plant (Δu -> Δv), discrete at Ts.
 """
 
 import argparse
@@ -26,24 +29,16 @@ import multiprocessing as mp
 
 from PID import PID  # your existing PID implementation
 
-
 JSON_FILE = "metric_scales_n.json"
-FIXED_KAW = 1.0  # anti-windup gain is fixed, not tuned
-
+FIXED_KAW = 1.0  # anti-windup gain fixed (not tuned)
 
 # ---------------------------------------------------------------------------
 # Helper for multiprocessing workers
 # ---------------------------------------------------------------------------
 
 def _pso_worker(args):
-    """
-    Helper for multiprocessing.Pool.map.
-
-    args = (x, objective, objective_args)
-    """
     x, objective, objective_args = args
     return objective(x, *objective_args)
-
 
 # ---------------------------------------------------------------------------
 # PSO implementation using scalar cost J
@@ -62,7 +57,6 @@ def pso(objective,
         num_workers=1,
         objective_args=None):
     """Standard PSO minimizing scalar J(x), with optional multiprocessing."""
-
     if seed is not None:
         np.random.seed(seed)
 
@@ -91,9 +85,7 @@ def pso(objective,
 
     def eval_particles(particles_batch):
         if pool is None:
-            # single-process
             return [objective(x, *objective_args) for x in particles_batch]
-        # multi-process: pack each particle with objective + args
         jobs = [(x, objective, objective_args) for x in particles_batch]
         return pool.map(_pso_worker, jobs)
 
@@ -108,14 +100,7 @@ def pso(objective,
                 "iter": 0,
                 "particle": int(i),
                 "J": float(J),
-                "SSE": float(metrics["SSE"]),
-                "OS": float(metrics["OS"]),
-                "TsTr": float(metrics["TsTr"]),
-                "RVG": float(metrics["RVG"]),
-                "ODJ": float(metrics["ODJ"]),
-                "u_rms": float(metrics["u_rms"]),
-                "du_rms": float(metrics["du_rms"]),
-                "sat_ratio": float(metrics["sat_ratio"]),
+                **{k: float(v) for k, v in metrics.items()}
             })
 
         best_idx = int(np.argmin(pbest_values))
@@ -163,15 +148,8 @@ def pso(objective,
                         "iter": it,
                         "particle": int(i),
                         "J": float(J),
-                        "SSE": float(metrics["SSE"]),
-                        "OS": float(metrics["OS"]),
-                        "TsTr": float(metrics["TsTr"]),
-                        "RVG": float(metrics["RVG"]),
-                        "ODJ": float(metrics["ODJ"]),
-                        "u_rms": float(metrics["u_rms"]),
-                        "du_rms": float(metrics["du_rms"]),
-                        "sat_ratio": float(metrics["sat_ratio"]),
-                        "best_x": gbest_position.tolist(), 
+                        **{k: float(v) for k, v in metrics.items()},
+                        "best_x": gbest_position.tolist(),
                         "best_cost": float(gbest_value)
                     })
 
@@ -199,18 +177,16 @@ def pso(objective,
 
     return gbest_position, gbest_value, history
 
-
 # ---------------------------------------------------------------------------
 # Plant and simulation
 # ---------------------------------------------------------------------------
 
 def scale_plant(Gd, gain):
-    """Scale the discrete plant gain."""
+    """Scale the discrete incremental plant gain (Δv/Δu)."""
     num, den = ctl.tfdata(Gd)
     num = np.squeeze(num) * gain
     den = np.squeeze(den)
     return ctl.TransferFunction(num, den, Gd.dt)
-
 
 def sim_closed_loop_pid(kp, ki, kd,
                         N, Ts,
@@ -219,17 +195,23 @@ def sim_closed_loop_pid(kp, ki, kd,
                         t_final=5.0,
                         ref=1.0,
                         base_ref=1.0,
+                        u0=0.0,
                         disturb_time=None,
                         disturb_value=0.0):
     """
-    Closed-loop simulation with discrete PID and discrete plant Gd
-    using state-space stepping.
+    Closed-loop simulation with discrete PID and INCREMENTAL discrete plant Gd (Δu -> Δv).
+
+    Absolute signals:
+        y_abs = base_ref + dv
+        u_abs = clip( PID(r_abs, y_abs_meas), [u_min, u_max] )
+
+    Plant update uses du = u_abs - u0.
     """
     pid = PID(kp, ki, kd, N, Ts, u_min, u_max, kb_aw, der_on_meas=True)
 
     n_steps = int(t_final / Ts)
     t = np.arange(n_steps + 1) * Ts
-    r = np.full_like(t, ref, dtype=float)
+    r = np.full_like(t, ref, dtype=float)  # absolute reference
 
     Ad, Bd, Cd, Dd = ctl.ssdata(ctl.ss(Gd))
     Ad = np.asarray(Ad, dtype=float)
@@ -238,50 +220,84 @@ def sim_closed_loop_pid(kp, ki, kd,
     Dd = np.asarray(Dd, dtype=float).reshape(-1)
 
     x = np.zeros(Ad.shape[0], dtype=float)
-    y = np.full_like(t, base_ref, dtype=float)
-    u = np.zeros_like(t, dtype=float)
 
-    # Some gaussian noise to measurement so that the resulting
-    # pid is more robust to small variations.
-    # Might penalize derivative component heavily, dunno lol
+    dv = np.zeros_like(t, dtype=float)                 # incremental output
+    y = np.full_like(t, base_ref, dtype=float)         # absolute output
+    u = np.full_like(t, u0, dtype=float)               # absolute throttle
+
     meas_noise_std = 0.05
 
     for k in range(n_steps):
+        # reconstruct absolute output
+        y[k] = base_ref + dv[k]
+
+        # absolute measurement + disturbance + noise
         y_meas = y[k]
         if disturb_time is not None and t[k] >= disturb_time:
             y_meas = y_meas + disturb_value
-
         if meas_noise_std > 0:
             y_meas += np.random.normal(0.0, meas_noise_std)
 
-        u[k] = pid.step(r[k], y_meas)
+        # PID output interpreted as ABSOLUTE throttle
+        u_abs = float(pid.step(r[k], y_meas))
+        u_abs = float(np.clip(u_abs, u_min, u_max))
 
-        x = Ad @ x + Bd * u[k]
-        y[k+1] = (Cd @ x + Dd * u[k]).item()
+        # incremental plant input
+        du = u_abs - u0
 
+        # update incremental plant
+        x = Ad @ x + Bd * du
+        dv[k + 1] = (Cd @ x + Dd * du).item()
+
+        # log
+        u[k] = u_abs
+
+    y[-1] = base_ref + dv[-1]
+    u[-1] = u[-2]
     return t, y, u
 
+def step_metrics(t, y, ref=1.0, tol=0.02, base_ref=1.0, tol_abs_min=0.05):
+    """
+    Compute:
+      SSE (abs)
+      OS (% of step size)
+      Tr (10-90% of step size)
+      Ts_ (settling time within band around ref, band based on step size)
 
-def step_metrics(t, y, ref=1.0, tol=0.02, base_ref=1.0):
-    """Compute SSE, overshoot (OS%), rise time Tr, settling time Ts_."""
+    tol: relative band w.r.t. step magnitude
+    tol_abs_min: minimum absolute settling band
+    """
     y = np.asarray(y, dtype=float)
     t = np.asarray(t, dtype=float)
 
-    SSE = abs(ref - y[-1])
-    OS = max(0.0, (np.max(y) - ref) / max(ref, 1e-6) * 100.0)
+    step = ref - base_ref
+    step_mag = max(abs(step), 1e-6)
 
-    y10 = (0.1 * (ref-base_ref)) + base_ref
-    y90 = (0.9 * (ref-base_ref)) + base_ref
+    SSE = abs(ref - y[-1])
+
+    # overshoot relative to step magnitude
+    OS = max(0.0, (np.max(y) - ref) / step_mag * 100.0)
+
+    # rise time (10-90%) relative to step
+    y10 = base_ref + 0.1 * step
+    y90 = base_ref + 0.9 * step
     try:
-        idx_10 = np.where(y > y10)[0][0]
-        idx_90 = np.where(y > y90)[0][0]
+        if step >= 0:
+            idx_10 = np.where(y >= y10)[0][0]
+            idx_90 = np.where(y >= y90)[0][0]
+        else:
+            idx_10 = np.where(y <= y10)[0][0]
+            idx_90 = np.where(y <= y90)[0][0]
         Tr = t[idx_90] - t[idx_10]
     except IndexError:
         Tr = t[-1]
         OS += 100.0
 
-    lower = ref * (1 - tol)
-    upper = ref * (1 + tol)
+    # settling band around ref based on step magnitude (with absolute floor)
+    band = max(tol * step_mag, tol_abs_min)
+    lower = ref - band
+    upper = ref + band
+
     Ts_ = t[-1]
     for i in range(len(t) - 1, -1, -1):
         if y[i] < lower or y[i] > upper:
@@ -289,7 +305,6 @@ def step_metrics(t, y, ref=1.0, tol=0.02, base_ref=1.0):
             break
 
     return SSE, OS, Tr, Ts_
-
 
 # ---------------------------------------------------------------------------
 # Raw metrics (no normalization)
@@ -301,16 +316,17 @@ def pid_metrics_raw(x,
                     u_min, u_max,
                     t_final=5.0,
                     ref=1.0,
-                    base_ref=1.0):
+                    base_ref=1.0,
+                    u0=0.0):
     """
     x = [kp, ki, kd, N]
     Compute raw metrics for cost:
-      SSE_nom, OS_nom, TsTr_nom, RVG, ODJ, u_rms, du_rms, sat_ratio
+      SSE, OS, TsTr, RVG, ODJ, u_rms, du_rms, sat_ratio
     """
     kp, ki, kd, N = x
     kb_aw = FIXED_KAW
 
-    # Nominal response
+    # Nominal response (ABS evaluation, incremental plant)
     t_nom, y_nom, u_nom = sim_closed_loop_pid(
         kp, ki, kd,
         N, Ts,
@@ -318,6 +334,7 @@ def pid_metrics_raw(x,
         u_min, u_max, kb_aw,
         t_final, ref,
         base_ref,
+        u0=u0,
         disturb_time=None,
         disturb_value=0.0
     )
@@ -332,7 +349,8 @@ def pid_metrics_raw(x,
         N, Ts,
         Gd_low,
         u_min, u_max, kb_aw,
-        t_final, ref,base_ref,
+        t_final, ref, base_ref,
+        u0=u0,
         disturb_time=None,
         disturb_value=0.0
     )
@@ -344,7 +362,8 @@ def pid_metrics_raw(x,
         N, Ts,
         Gd_high,
         u_min, u_max, kb_aw,
-        t_final, ref,base_ref,
+        t_final, ref, base_ref,
+        u0=u0,
         disturb_time=None,
         disturb_value=0.0
     )
@@ -359,16 +378,17 @@ def pid_metrics_raw(x,
 
     RVG = dSSE + dOS + dTsTr
 
-    # disturbance rejection
+    # disturbance rejection (output disturbance on measurement)
     disturb_time = t_final * 0.6
-    disturb_value = ref * 0.1
+    disturb_value = (ref - base_ref) * 0.1  # 10% of step magnitude
 
     t_dist, y_dist, _ = sim_closed_loop_pid(
         kp, ki, kd,
         N, Ts,
         Gd,
         u_min, u_max, kb_aw,
-        t_final, ref,base_ref,
+        t_final, ref, base_ref,
+        u0=u0,
         disturb_time=disturb_time,
         disturb_value=disturb_value
     )
@@ -398,13 +418,11 @@ def pid_metrics_raw(x,
     }
     return metrics
 
-
 # ---------------------------------------------------------------------------
 # Offline scale computation (median + IQR)
 # ---------------------------------------------------------------------------
 
 def robust_scale(arr: np.ndarray) -> float:
-    """Return median+IQR as robust scale for array."""
     arr = np.asarray(arr, dtype=float)
     if arr.size == 0:
         return 1.0
@@ -414,7 +432,6 @@ def robust_scale(arr: np.ndarray) -> float:
     iqr = q3 - q1
     return float(max(med + iqr, 1e-3))
 
-
 def compute_metric_scales(Gd,
                           Ts,
                           bounds,
@@ -423,67 +440,34 @@ def compute_metric_scales(Gd,
                           T_sim,
                           setpoint,
                           ref_pv,
+                          u0,
                           num_samples=300,
                           seed=42,
                           out_path=JSON_FILE):
     """Randomly sample PID params in bounds, compute metrics, derive median+IQR scales."""
     rng = np.random.default_rng(seed)
 
-    SSE_vals = []
-    OS_vals = []
-    TsTr_vals = []
-    RVG_vals = []
-    ODJ_vals = []
-    u_vals = []
-    du_vals = []
-    sat_vals = []
+    buckets = {k: [] for k in ["SSE","OS","TsTr","RVG","ODJ","u_rms","du_rms","sat_ratio"]}
 
     for i in range(num_samples):
-        # Sample full vector [kp, ki, kd, N]
-        sample = np.array(
-            [rng.uniform(*b) for b in bounds],
-            dtype=float
-        )
+        sample = np.array([rng.uniform(*b) for b in bounds], dtype=float)
 
         metrics = pid_metrics_raw(
             sample, Gd,
             Ts=Ts,
             u_min=u_min, u_max=u_max,
-            t_final=T_sim, ref=setpoint, 
-            base_ref=ref_pv
+            t_final=T_sim, ref=setpoint,
+            base_ref=ref_pv,
+            u0=u0
         )
 
-        SSE_vals.append(metrics["SSE"])
-        OS_vals.append(metrics["OS"])
-        TsTr_vals.append(metrics["TsTr"])
-        RVG_vals.append(metrics["RVG"])
-        ODJ_vals.append(metrics["ODJ"])
-        u_vals.append(metrics["u_rms"])
-        du_vals.append(metrics["du_rms"])
-        sat_vals.append(metrics["sat_ratio"])
+        for k in buckets:
+            buckets[k].append(metrics[k])
 
         if (i + 1) % 50 == 0:
             print(f"Scale sample {i+1}/{num_samples}")
 
-    SSE_vals = np.array(SSE_vals)
-    OS_vals = np.array(OS_vals)
-    TsTr_vals = np.array(TsTr_vals)
-    RVG_vals = np.array(RVG_vals)
-    ODJ_vals = np.array(ODJ_vals)
-    u_vals = np.array(u_vals)
-    du_vals = np.array(du_vals)
-    sat_vals = np.array(sat_vals)
-
-    scales = {
-        "SSE": robust_scale(SSE_vals),
-        "OS": robust_scale(OS_vals),
-        "TsTr": robust_scale(TsTr_vals),
-        "RVG": robust_scale(RVG_vals),
-        "ODJ": robust_scale(ODJ_vals),
-        "u_rms": robust_scale(u_vals),
-        "du_rms": robust_scale(du_vals),
-        "sat_ratio": robust_scale(sat_vals),
-    }
+    scales = {k: robust_scale(np.array(v)) for k, v in buckets.items()}
 
     print("Computed metric scales (median+IQR):")
     for k, v in scales.items():
@@ -492,12 +476,9 @@ def compute_metric_scales(Gd,
     with open(out_path, "w") as f:
         json.dump(scales, f, indent=2)
     print(f"Saved scales to {out_path}")
-
     return scales
 
-
 def load_metric_scales(path=JSON_FILE):
-    """Load metric scales from JSON, with safe defaults if missing."""
     default = {
         "SSE": 1.0,
         "OS": 10.0,
@@ -519,7 +500,6 @@ def load_metric_scales(path=JSON_FILE):
     except Exception:
         return default
 
-
 # ---------------------------------------------------------------------------
 # Normalized numeric cost
 # ---------------------------------------------------------------------------
@@ -530,6 +510,7 @@ def pid_cost_normalized(x,
                         u_min, u_max,
                         t_final, ref,
                         base_ref,
+                        u0,
                         scales,
                         weights=None):
     """
@@ -542,30 +523,30 @@ def pid_cost_normalized(x,
         x, Gd,
         Ts=Ts,
         u_min=u_min, u_max=u_max,
-        t_final=t_final, ref=ref, base_ref=base_ref
+        t_final=t_final, ref=ref,
+        base_ref=base_ref,
+        u0=u0
     )
 
     if weights is None:
         weights = {
-            "SSE":    7.0,
-            "OS":     3.0,
-            "TsTr":   3.0,
-            "RVG":    2.0,
-            "ODJ":    1.2,
-            "u_rms":  0.5,
-            "du_rms": 4.0,
-            "sat_ratio": 0.4,
+            "SSE":      5.0,
+            "OS":       3.0,
+            "TsTr":     2.0,
+            "RVG":      2.0,
+            "ODJ":      1.2,
+            "u_rms":    0.5,
+            "du_rms":   2.0,
+            "sat_ratio":0.5,
         }
 
     J = 0.0
     for name, val in metrics.items():
         sigma = float(scales.get(name, 1.0))
         sigma = max(sigma, 1e-6)
-        g = val / sigma
-        J += weights.get(name, 0.0) * g
+        J += weights.get(name, 0.0) * (val / sigma)
 
     return float(J), metrics
-
 
 # ---------------------------------------------------------------------------
 # Top-level objective for multiprocessing
@@ -579,22 +560,19 @@ def objective_pid_global(x,
                          T_sim,
                          setpoint,
                          ref_pv,
+                         u0,
                          scales,
                          weights=None):
-    """
-    Top-level objective for multiprocessing.
-    x = [kp, ki, kd, N]
-    """
     return pid_cost_normalized(
         x, Gd,
         Ts=Ts,
         u_min=u_min, u_max=u_max,
         t_final=T_sim, ref=setpoint,
         base_ref=ref_pv,
+        u0=u0,
         scales=scales,
         weights=weights,
     )
-
 
 # ---------------------------------------------------------------------------
 # main
@@ -605,36 +583,40 @@ def main(args):
 
     # General settings
     Ts = 0.01
-    u_min = 0.0 
+    u_min = 0.0
     u_max = 1.0
     T_sim = 80.0
-    '''
-    # Plant fitted with maximum speed 
-    Td = 0.15
-    G0 = 12.68 / (s**2 + 1.076*s + 0.2744)
-    num_delay, den_delay = ctl.pade(Td, 1)
-    H_delay = ctl.tf(num_delay, den_delay)
-    Gc = G0 * H_delay
-    Gd = ctl.c2d(Gc, Ts, method="tustin")
-    '''
-   
-    # Plants for each range, only leave one uncommented, obviously
-    #G0 = ctl.TransferFunction([0, 7.8409],[1.0000, 0.3321]) # Low speed range
-    G0 = ctl.TransferFunction([0, 56.3703, 155.5811, 2.6035],[1.0000, 15.5755, 2.6333, 0.0852]) # middle range
-    #G0 = ctl.TransferFunction([0,45.5849,23.7842,0.5994],[1.0000, 2.4052, 0.2322, 0.0144]) # High speed range
-    Gd = ctl.c2d(G0, Ts, method='tustin')
-    
-    ref_pv = ((22.22222 - 11.111111) / 2.0) + 11.111111
-    setpoint = 22.22222 
 
-    
+    # ------------------------------------------------------------------
+    # Operating point for the SPEED RANGE YOU ARE TUNING
+    # v0 = base_ref (speed operating point)
+    # u0 = throttle operating point
+    # ------------------------------------------------------------------
+    # Example for high range (define these based on your identified range):
+    ref_pv = ((11.11111 - 0.0) / 2.0) + 0.0  # v0
+    setpoint = 11.11111                                 # absolute setpoint
+    u0 = 0.35                                          # throttle operating point (ABS)
+
+    # ------------------------------------------------------------------
+    # IMPORTANT: Gd must represent the INCREMENTAL plant Δv/Δu (Remove Means)
+    # and it must be discrete with dt=Ts.
+    # ------------------------------------------------------------------
+
+    # Incremental Plant
+    #G0 = ctl.TransferFunction([0,   16.0307,  241.7231], # High speeds
+    #                          [1.0000, 13.8711, 2.1097])
+    #G0 = ctl.TransferFunction([0, 12.3082, 67.2242], # Mid Speeds
+    #                         [1.0000, 5.2957, 1.0404])
+    G0 = ctl.TransferFunction([0,    8.5777,   54.0770], # Low speeds
+                              [1.0000,    7.0533,    2.1718])
+    Gd = ctl.c2d(G0, Ts, method='tustin')
 
     # PID search bounds: [kp, ki, kd, N]
     bounds = [
-        (0.0, 2.0),   # Kp
-        (0.0, 1.0),   # Ki
-        (0.0, 1.5),  # Kd
-        (5.0, 15.0),  # N
+        (0.0, 2.0),    # Kp
+        (0.0, 1.0),    # Ki
+        (0.0, 1.5),    # Kd
+        (5.0, 15.0),   # N
     ]
 
     # Optional: offline scales computation mode
@@ -644,6 +626,7 @@ def main(args):
             bounds=bounds,
             u_min=u_min, u_max=u_max,
             T_sim=T_sim, setpoint=setpoint, ref_pv=ref_pv,
+            u0=u0,
             num_samples=args.scale_samples,
             seed=args.seed if args.seed != 0 else 42,
             out_path=JSON_FILE
@@ -669,7 +652,7 @@ def main(args):
         verbose=args.v,
         log_path=json_file,
         num_workers=args.workers,
-        objective_args=(Gd, Ts, u_min, u_max, T_sim, setpoint, ref_pv, scales, None),
+        objective_args=(Gd, Ts, u_min, u_max, T_sim, setpoint, ref_pv, u0, scales, None),
     )
 
     print(f"Best X: {best_x}")
@@ -684,7 +667,7 @@ def main(args):
     plt.title("Best cost history")
     plt.grid(True)
 
-    # --- New: simulate and plot step response for best controller ---
+    # Simulate and plot best controller
     kp, ki, kd, N = best_x
     kb_aw = FIXED_KAW
 
@@ -695,73 +678,46 @@ def main(args):
         u_min, u_max, kb_aw,
         t_final=T_sim, ref=setpoint,
         base_ref=ref_pv,
+        u0=u0,
         disturb_time=None,
         disturb_value=0.0
     )
 
     # Output vs reference
     plt.figure()
-    plt.plot(t_best, y_best, label="Output y(t)")
+    plt.plot(t_best, y_best, label="Speed y(t) [abs]")
     plt.plot(t_best, np.full_like(t_best, setpoint), "k--", label="Reference")
     plt.xlabel("time [s]")
-    plt.ylabel("speed")
-    plt.title("Step response of best PID")
+    plt.ylabel("speed [m/s]")
+    plt.title("Step response of best PID (abs, incremental plant underneath)")
     plt.grid(True)
     plt.legend()
 
     # Control signal
     plt.figure()
-    plt.plot(t_best, u_best, label="u(t)")
+    plt.plot(t_best, u_best, label="Throttle u(t) [abs]")
     plt.xlabel("time [s]")
-    plt.ylabel("control signal u")
-    plt.title("Control signal of best PID")
+    plt.ylabel("throttle")
+    plt.title("Control signal of best PID (absolute)")
     plt.grid(True)
     plt.legend()
 
     plt.show()
 
-    
-
-
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="PSO PID Tuning (kp,ki,kd,N; offline normalized)")
+    parser = argparse.ArgumentParser(description="PSO PID Tuning for incremental plants (kp,ki,kd,N)")
 
-    parser.add_argument(
-        "-v",
-        action="store_true",
-        help="Enable verbose output"
-    )
-    parser.add_argument(
-        "-o",
-        type=str,
-        default="pso_log_n.json",
-        help="Path to log JSON file"
-    )
-    parser.add_argument(
-        "--seed",
-        type=int,
-        default=0,
-        help="Numpy random number generator seed (0 -> random)"
-    )
+    parser.add_argument("-v", action="store_true", help="Enable verbose output")
+    parser.add_argument("-o", type=str, default="pso_log_n.json", help="Path to log JSON file")
+    parser.add_argument("--seed", type=int, default=0, help="Numpy seed (0 -> random)")
 
-    parser.add_argument(
-        "--compute-scales",
-        action="store_true",
-        help="Run offline random scan to compute metric scales and exit"
-    )
-    parser.add_argument(
-        "--scale-samples",
-        type=int,
-        default=300,
-        help="Number of random PIDs to sample when computing scales"
-    )
+    parser.add_argument("--compute-scales", action="store_true",
+                        help="Run offline random scan to compute metric scales and exit")
+    parser.add_argument("--scale-samples", type=int, default=300,
+                        help="Number of random PIDs to sample when computing scales")
 
-    parser.add_argument(
-        "--workers",
-        type=int,
-        default=1,
-        help="Number of worker processes for parallel evaluation (1 = no multiprocessing)"
-    )
+    parser.add_argument("--workers", type=int, default=1,
+                        help="Worker processes for parallel evaluation (1 = no multiprocessing)")
 
     args = parser.parse_args()
     main(args)
