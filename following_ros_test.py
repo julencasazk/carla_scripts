@@ -18,28 +18,6 @@ from PlatooningROS import PlatoonMember
 
 
 class FollowingRosTest(Node):
-    """ROS2 platoon longitudinal test (multi-vehicle version).
-
-    - Connects to CARLA in synchronous mode (dt = Ts).
-    - Spawns a platoon of Tesla Model 3s of length --plen at spawn point 54.
-    - Publishes per-vehicle state topics for CARLA-agnostic PlatoonMember nodes:
-            <name>/state/speed
-            <name>/state/dist_to_veh
-            <name>/state/setpoint
-            <name>/state/platoon_enabled
-        and a global platoon setpoint:
-            /platoon/plat_0/setpoint
-    - Subscribes to per-vehicle command topics from PlatoonMember nodes:
-            <name>/command/throttle
-            <name>/command/brake
-        and applies them to CARLA vehicles.
-    - Runs a step-test sequence of lead speed setpoints (like the original
-        platooning script), advancing the global setpoint when the ego member's
-        speed settles within a band.
-    - Attaches a dashcam to the ego vehicle and displays it via OpenCV in a
-        background thread.
-    - Logs ego data to CSV (time, throttle, setpoint, brake, speed, accel).
-    """
 
     def __init__(self, args: argparse.Namespace) -> None:
         super().__init__("following_ros_test")
