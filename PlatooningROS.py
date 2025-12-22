@@ -18,7 +18,7 @@ import math
 
 import rclpy
 from rclpy.node import Node
-from rclpy.qos import QoSProfile, QoSReliabilityPolicy
+from rclpy.qos import QoSDurabilityPolicy, QoSProfile, QoSReliabilityPolicy
 from std_msgs.msg import Float32, Bool
 
 from PID import PID
@@ -72,6 +72,14 @@ class PlatoonMember(Node):
         self._last_eff_sp = 0.0
         self._last_dist_err = 0.0
 
+        # Speed-range scheduling (matches Platooning.py thresholds)
+        self._v1 = 11.11
+        self._v2 = 22.22
+        self._h = 1.0
+        self._current_range = "low"  # "low" | "mid" | "high"
+
+        self._dbg_print_idx = 0
+
         # Optional debug logging for timing/behavior (used mainly for leader)
         self._debug_step_idx = 0
         self._debug_writer = None
@@ -93,13 +101,24 @@ class PlatoonMember(Node):
             except Exception:
                 self._debug_writer = None
 
-        qos_subs = QoSProfile(
+        # QoS profiles:
+        # - State streams @100 Hz: "latest sample" semantics, no backlog.
+        # - Setpoint/mode: do not drop, and allow late-joiners to receive last value.
+        # - Commands: do not drop actuator commands.
+        qos_state = QoSProfile(
+            depth=1,
+            reliability=QoSReliabilityPolicy.BEST_EFFORT,
+            durability=QoSDurabilityPolicy.VOLATILE,
+        )
+        qos_setpoint = QoSProfile(
             depth=1,
             reliability=QoSReliabilityPolicy.RELIABLE,
+            durability=QoSDurabilityPolicy.TRANSIENT_LOCAL,
         )
-        qos_pubs = QoSProfile(
-            depth=10,
-            reliability=QoSReliabilityPolicy.BEST_EFFORT,
+        qos_cmd = QoSProfile(
+            depth=1,
+            reliability=QoSReliabilityPolicy.RELIABLE,
+            durability=QoSDurabilityPolicy.VOLATILE,
         )
 
         # Subscriptions
@@ -107,7 +126,7 @@ class PlatoonMember(Node):
             Float32,
             f"{self._name}/state/speed",
             self.speed_cb,
-            qos_subs,
+            qos_state,
         )
 
         # ACC / local setpoint
@@ -115,7 +134,7 @@ class PlatoonMember(Node):
             Float32,
             f"{self._name}/state/setpoint",
             self.setpoint_cb,
-            qos_subs,
+            qos_setpoint,
         )
 
         # Distance to preceding vehicle
@@ -123,7 +142,7 @@ class PlatoonMember(Node):
             Float32,
             f"{self._name}/state/dist_to_veh",
             self.dist_to_veh_cb,
-            qos_subs,
+            qos_state,
         )
 
         # Platoon coordination topics (same for all vehicles)
@@ -131,42 +150,33 @@ class PlatoonMember(Node):
             Float32,
             f"/platoon/{platoon_id}/setpoint",
             self.platoon_sp_cb,
-            qos_subs,
+            qos_setpoint,
         )
         self._platoon_mode_sub = self.create_subscription(
             Bool,
             f"{self._name}/state/platoon_enabled",
             self.platoon_mode_cb,
-            qos_subs,
+            qos_setpoint,
         )
 
         # Publishers (unchanged)
         self._throttle_pub = self.create_publisher(
             Float32,
             f"{self._name}/command/throttle",
-            qos_subs,
+            qos_cmd,
         )
         self._brake_pub = self.create_publisher(
             Float32,
             f"{self._name}/command/brake",
-            qos_subs,
+            qos_cmd,
         )
         
         self._local_sp_pub = self.create_publisher(
             Float32,
             f"{self._name}/state/local_setpoint",
-            qos_subs,
+            qos_state,
         )
         
-        # For the leader, update the platoon global setpoint to match its own
-        self._platoon_sp_pub = self.create_publisher(
-            Float32,
-            f"/platoon/{platoon_id}/setpoint",
-            qos_subs,
-        )
-
-        
-
         # Timer-driven control loop by default. For fully deterministic
         # coupling to a simulator tick (e.g. CARLA 100 Hz), the caller can
         # disable this timer and invoke _control_loop or step_once() manually
@@ -197,14 +207,16 @@ class PlatoonMember(Node):
         """
         Compute the effective speed setpoint for this member.
 
-        Rules:
-          * Base setpoint:
-              - platoon_enabled == False -> local ACC setpoint (_setpoint)
-              - platoon_enabled == True  -> global platoon setpoint (_platoon_sp)
-          * Distance logic always applies if there is a valid front vehicle
-            (dist_to_veh > 0), but:
-              - ACC / lead: only slow down (never increase above base_sp)
-              - platoon follower: symmetric (can speed up or slow down)
+        Exact behavioral port of Platooning.py:
+          * lead: speed_sp = base_sp
+          * follower: speed_sp = base_sp + d_sp, where
+              desired_dist = max(min_spacing + 3.0, v*T + min_spacing)
+              dist_err = dist_to_veh - desired_dist
+              d_sp = K*dist_err if dist_err >= 0 else 2*K*dist_err
+
+        base_sp selection:
+          * platoon_enabled == False -> local setpoint (_setpoint)
+          * platoon_enabled == True  -> global platoon setpoint (_platoon_sp)
         """
         speed = self._speed
 
@@ -217,61 +229,63 @@ class PlatoonMember(Node):
         # Store for debugging
         self._last_base_sp = base_sp
 
-        # If we have no information about a vehicle ahead, use base setpoint
+        # Lead ignores distance logic (matches Platooning.py lead behavior).
+        if self._role == "lead":
+            self._last_dist_err = 0.0
+            self._last_eff_sp = base_sp
+            return base_sp
+
+        # If we have no information about a vehicle ahead, use base setpoint.
         if self._dist_to_veh <= 0.0:
             self._last_dist_err = 0.0
             self._last_eff_sp = base_sp
             return base_sp
 
-        # Compute spacing error
-        desired_dist = speed * self._desired_time_headway + self._min_spacing
+        desired_dist = max(
+            self._min_spacing + 3.0,
+            speed * self._desired_time_headway + self._min_spacing,
+        )
         dist_err = self._dist_to_veh - desired_dist
         self._last_dist_err = dist_err
 
-        # --- Not in platoon: pure ACC behavior, only slow down when too close ---
-        if not self._platoon_enabled:
-            if dist_err < 0.0:
-                # Too close: reduce setpoint (braking more important)
-                d_sp = 2.0 * self._K_dist * dist_err
-            else:
-                # Far enough or opening gap: do not increase beyond base setpoint
-                d_sp = 0.0
-
-            eff_sp = base_sp + d_sp
-            self._last_eff_sp = eff_sp
-            return eff_sp
-
-        # --- In platoon ---
-        if self._role == "lead":
-            # Platoon lead: track global setpoint, but still ensure safety by
-            # reducing setpoint if too close; never increase above base_sp
-            if dist_err < 0.0:
-                d_sp = 2.0 * self._K_dist * dist_err
-            else:
-                d_sp = 0.0
-
-            eff_sp = base_sp + d_sp
-            self._last_eff_sp = eff_sp
-
-            # Leader updates the global platoon septoint
-            self._platoon_sp_pub.publish(Float32(data=eff_sp))
-
-            return eff_sp
-
-        # Follower in platoon: apply symmetric spacing correction (as before)
         if dist_err >= 0.0:
-            # For safety, only speed up if the setpoint change is positive
-            # if platoon slowing, DONT close the gap accelerating.
-            if self._setpoint >= self._last_setpoint:
-                d_sp = self._K_dist * dist_err
-            else:
-                d_sp = 0.0
+            d_sp = self._K_dist * dist_err
         else:
             d_sp = 2.0 * self._K_dist * dist_err
 
         eff_sp = base_sp + d_sp
         self._last_eff_sp = eff_sp
         return eff_sp
+
+    def _select_pid(self) -> PID:
+        if self._current_range == "high":
+            return self._fast_pid
+        if self._current_range == "mid":
+            return self._mid_pid
+        return self._slow_pid
+
+    def _update_speed_range(self, speed: float) -> bool:
+        prev = self._current_range
+
+        if self._current_range == "low":
+            if speed > self._v1 + self._h:
+                self._current_range = "mid"
+        elif self._current_range == "mid":
+            if speed > self._v2 + self._h:
+                self._current_range = "high"
+            elif speed < self._v1 - self._h:
+                self._current_range = "low"
+        else:  # high
+            if speed < self._v2 - self._h:
+                self._current_range = "mid"
+
+        return self._current_range != prev
+
+    def _reset_selected_pid(self) -> None:
+        try:
+            self._select_pid().reset()
+        except Exception:
+            pass
 
     def compute_control(self):
         """
@@ -301,7 +315,9 @@ class PlatoonMember(Node):
             except Exception:
                 pass
 
-        u = self._slow_pid.step(speed_sp, speed_meas)
+        if self._update_speed_range(speed_meas):
+            self._reset_selected_pid()
+        u = self._select_pid().step(speed_sp, speed_meas)
 
         if u > 0.0:
             throttle = float(u)
@@ -309,6 +325,18 @@ class PlatoonMember(Node):
         else:
             throttle = 0.0
             brake = float(abs(u))
+
+        # Lightweight periodic debug (helps diagnose "stuck at 0 throttle").
+        self._dbg_print_idx += 1
+        if (self._dbg_print_idx % 50) == 0 and self._role == "lead":
+            try:
+                self.get_logger().info(
+                    f"[{self._name}] v={speed_meas:.2f} base_sp={self._last_base_sp:.2f} "
+                    f"platoon_sp={self._platoon_sp:.2f} enabled={self._platoon_enabled} "
+                    f"u={u:.3f} th={throttle:.3f} br={brake:.3f}"
+                )
+            except Exception:
+                pass
 
         return throttle, brake, speed_sp
 
