@@ -56,3 +56,9 @@ class PID:
 
         self.e_prev = e
         return u
+
+    def reset(self):
+        self.i_state = 0.0
+        self.e_prev = 0.0
+        self.d_prev = 0.0
+        self.w_prev = 0.0
