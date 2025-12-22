@@ -111,7 +111,8 @@ def main(args, img_queue, char_queue, img_lock):
     ])
     csv_file.flush()
 
-    setpoints = [22.22, 33.33, 27.78, 24.4, 30.0, 33.33, 22.22]
+    #setpoints = [22.22, 33.33, 27.78, 24.4, 30.0, 33.33, 22.22]
+    setpoints = [0.0, 11.11, 5.55, 2.555, 11.111, 0.0, 2.555, 0.000]
     idx = 0
 
     v1 = 11.11
