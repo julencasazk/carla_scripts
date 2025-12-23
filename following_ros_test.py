@@ -86,14 +86,26 @@ class FollowingRosTest(Node):
 
         # Platoon configuration
         self.plen = int(args.plen)
-        # index of ego vehicle for logging/dashcam: last in platoon if >1, else leader
-        self.ego_index = self.plen - 1 if self.plen > 1 else 0
+        # Optional MCU-controlled vehicle index. If set, that vehicle is named
+        # "veh_ego" and no Python PlatoonMember controller is spawned for it.
+        self.mcu_index = int(args.mcu_index) if args.mcu_index is not None else None
+        if self.mcu_index is not None and not (0 <= self.mcu_index < self.plen):
+            raise ValueError("--mcu-index must be in [0, plen-1]")
+
+        # index of ego vehicle for logging/dashcam:
+        # - if MCU index provided, use that as ego
+        # - else last in platoon if >1, else leader
+        if self.mcu_index is not None:
+            self.ego_index = self.mcu_index
+        else:
+            self.ego_index = self.plen - 1 if self.plen > 1 else 0
 
         # Per-vehicle ROS publishers (filled after spawning vehicles)
         self.ros_names = []
         self.speed_pubs = {}
         self.dist_pubs = {}
         self.platoon_mode_pubs = {}
+        self._ego_setpoint_pub = None
 
         # QoS profiles:
         # - State streams @100 Hz: "latest sample" semantics, no backlog.
@@ -171,7 +183,12 @@ class FollowingRosTest(Node):
 
         # Spawn platoon members
         for i in range(self.plen):
-            ros_name = "veh_lead" if i == 0 else f"veh_{i}"
+            if i == 0:
+                ros_name = "veh_lead"
+            elif self.mcu_index is not None and i == self.mcu_index:
+                ros_name = "veh_ego"
+            else:
+                ros_name = f"veh_{i}"
 
             spawn_tf = carla.Transform(
                 location=carla.Location(
@@ -207,21 +224,29 @@ class FollowingRosTest(Node):
             # Publish once (TRANSIENT_LOCAL) to avoid sending extra messages at 100 Hz.
             self.platoon_mode_pubs[ros_name].publish(Bool(data=True))
 
+            # MCU expects /veh_ego/state/setpoint (best effort). Only publish for veh_ego.
+            if ros_name == "veh_ego":
+                self._ego_setpoint_pub = self.create_publisher(
+                    Float32, f"{ros_name}/state/setpoint", self.qos_state
+                )
+
             # Command subscribers; controllers are PlatoonMember nodes
             self._last_cmd[ros_name] = {"throttle": 0.0, "brake": 0.0}
             self._last_local_sp[ros_name] = 0.0
 
+            # MCU publishes commands as BEST_EFFORT; make subscriptions compatible.
+            cmd_qos = self.qos_state if ros_name == "veh_ego" else self.qos_cmd
             self.create_subscription(
                 Float32,
                 f"{ros_name}/command/throttle",
                 lambda msg, n=ros_name: self._throttle_cb(msg, n),
-                self.qos_cmd,
+                cmd_qos,
             )
             self.create_subscription(
                 Float32,
                 f"{ros_name}/command/brake",
                 lambda msg, n=ros_name: self._brake_cb(msg, n),
-                self.qos_cmd,
+                cmd_qos,
             )
 
             # Local setpoint subscribers: each PlatoonMember publishes its
@@ -477,6 +502,8 @@ class FollowingRosTest(Node):
         # Current global lead speed setpoint
         sp = self.lead_speed_setpoints[self.lead_sp_idx]
         self.platoon_sp_pub.publish(Float32(data=float(sp)))
+        if self._ego_setpoint_pub is not None:
+            self._ego_setpoint_pub.publish(Float32(data=float(sp)))
 
         # Publish per-vehicle state
         dists = []
@@ -647,6 +674,12 @@ def main():
     parser.add_argument("-f", type=str, help="Output csv filename", default="out_ros.csv")
     parser.add_argument("--plen", type=int, default=2, help="Number of platoon members (>=1)")
     parser.add_argument(
+        "--mcu-index",
+        type=int,
+        default=None,
+        help="Optional index [0..plen-1] of the MCU vehicle; names it 'veh_ego' and skips the Python controller for it.",
+    )
+    parser.add_argument(
         "--teleport-dist",
         type=float,
         default=250.0,
@@ -683,6 +716,8 @@ def main():
 
     nodes = [bridge]
     for i, name in enumerate(bridge.ros_names):
+        if bridge.mcu_index is not None and i == bridge.mcu_index:
+            continue
         role = "lead" if i == 0 else "follower"
 
         slow_pid = PID(0.43127789, 0.43676547, 0.0, 15.0, Ts, u_min, u_max, kb_aw, der_on_meas=True)
