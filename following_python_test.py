@@ -257,7 +257,6 @@ def main(args, img_queue, char_queue, img_lock):
         sim_time = 0.0
         start_timestamp = None
         step = 0
-        last_tick_wall_s = None
 
         last_change_step = 0
         last_change_speed = 0.0
@@ -269,23 +268,7 @@ def main(args, img_queue, char_queue, img_lock):
             v.apply_control(carla.VehicleControl(throttle=0.0, brake=0.0))
 
         while not finished:
-            # Pace synchronous ticks to real-time (never faster than `dt` wall-time).
-            # This is useful when the rest of the system (e.g. microcontroller) runs at a fixed rate.
-            if last_tick_wall_s is not None:
-                next_tick_wall_s = last_tick_wall_s + dt
-                now_s = time.perf_counter()
-                if now_s < next_tick_wall_s:
-                    time.sleep(next_tick_wall_s - now_s)
-
             world.tick()
-            tick_wall_s = time.perf_counter()
-            if last_tick_wall_s is not None:
-                print(
-                    f"Wall dt between ticks: {tick_wall_s - last_tick_wall_s:.6f}s "
-                    f"(target >= {dt:.6f}s)"
-                )
-            last_tick_wall_s = tick_wall_s
-
             snapshot = world.get_snapshot()
             t = snapshot.timestamp.elapsed_seconds
             if start_timestamp is None:
