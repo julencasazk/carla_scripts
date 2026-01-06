@@ -101,10 +101,7 @@ class PlatoonMember(Node):
             except Exception:
                 self._debug_writer = None
 
-        # QoS profiles:
-        # - State streams @100 Hz: "latest sample" semantics, no backlog.
-        # - Setpoint/mode: do not drop, and allow late-joiners to receive last value.
-        # - Commands: do not drop actuator commands.
+        # QoS profiles: BEST_EFFORT + VOLATILE everywhere (MCU compatibility).
         qos_state = QoSProfile(
             depth=1,
             reliability=QoSReliabilityPolicy.BEST_EFFORT,
@@ -112,12 +109,12 @@ class PlatoonMember(Node):
         )
         qos_setpoint = QoSProfile(
             depth=1,
-            reliability=QoSReliabilityPolicy.RELIABLE,
-            durability=QoSDurabilityPolicy.TRANSIENT_LOCAL,
+            reliability=QoSReliabilityPolicy.BEST_EFFORT,
+            durability=QoSDurabilityPolicy.VOLATILE,
         )
         qos_cmd = QoSProfile(
             depth=1,
-            reliability=QoSReliabilityPolicy.RELIABLE,
+            reliability=QoSReliabilityPolicy.BEST_EFFORT,
             durability=QoSDurabilityPolicy.VOLATILE,
         )
 
@@ -328,7 +325,7 @@ class PlatoonMember(Node):
 
         # Lightweight periodic debug (helps diagnose "stuck at 0 throttle").
         self._dbg_print_idx += 1
-        if (self._dbg_print_idx % 50) == 0 and self._role == "lead":
+        if (self._dbg_print_idx % 500) == 0 and self._role == "lead":
             try:
                 self.get_logger().info(
                     f"[{self._name}] v={speed_meas:.2f} base_sp={self._last_base_sp:.2f} "
