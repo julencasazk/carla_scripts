@@ -83,6 +83,7 @@ class FollowingRosTest(Node):
 
         # Sampling time / CARLA dt
         self.Ts = 0.01
+        self.gate_on_first_throttle = bool(getattr(args, "gate_on_first_throttle", False))
 
         # Platoon configuration
         self.plen = int(args.plen)
@@ -107,10 +108,7 @@ class FollowingRosTest(Node):
         self.platoon_mode_pubs = {}
         self._ego_setpoint_pub = None
 
-        # QoS profiles:
-        # - State streams @100 Hz: "latest sample" semantics, no backlog.
-        # - Setpoint/mode: do not drop, and allow late-joiners to receive last value.
-        # - Commands: do not drop actuator commands.
+        # QoS profiles: match MCU expectations (BEST_EFFORT + VOLATILE everywhere).
         self.qos_state = QoSProfile(
             depth=1,
             reliability=QoSReliabilityPolicy.BEST_EFFORT,
@@ -118,12 +116,12 @@ class FollowingRosTest(Node):
         )
         self.qos_setpoint = QoSProfile(
             depth=1,
-            reliability=QoSReliabilityPolicy.RELIABLE,
-            durability=QoSDurabilityPolicy.TRANSIENT_LOCAL,
+            reliability=QoSReliabilityPolicy.BEST_EFFORT,
+            durability=QoSDurabilityPolicy.VOLATILE,
         )
         self.qos_cmd = QoSProfile(
             depth=1,
-            reliability=QoSReliabilityPolicy.RELIABLE,
+            reliability=QoSReliabilityPolicy.BEST_EFFORT,
             durability=QoSDurabilityPolicy.VOLATILE,
         )
 
@@ -134,6 +132,12 @@ class FollowingRosTest(Node):
 
         # Latest commands from PlatoonMember nodes (name -> dict)
         self._last_cmd = {}
+        # Wall-time of last received command messages (for latency analysis).
+        # Values are seconds from time.perf_counter(); None means "never received".
+        self._last_cmd_rx_wall_s = {}
+        self._last_throttle_rx_wall_s = {}
+        self._last_brake_rx_wall_s = {}
+        self._last_applied_cmd_rx_wall_s = {}
 
         # Latest local speed setpoints from PlatoonMember nodes (name -> float)
         self._last_local_sp = {}
@@ -232,6 +236,10 @@ class FollowingRosTest(Node):
 
             # Command subscribers; controllers are PlatoonMember nodes
             self._last_cmd[ros_name] = {"throttle": 0.0, "brake": 0.0}
+            self._last_cmd_rx_wall_s[ros_name] = None
+            self._last_throttle_rx_wall_s[ros_name] = None
+            self._last_brake_rx_wall_s[ros_name] = None
+            self._last_applied_cmd_rx_wall_s[ros_name] = None
             self._last_local_sp[ros_name] = 0.0
 
             # MCU publishes commands as BEST_EFFORT; make subscriptions compatible.
@@ -326,7 +334,7 @@ class FollowingRosTest(Node):
 
         # Lead speed setpoints (global platoon reference, m/s)
         self.lead_speed_setpoints = [
-            0.0,
+            11.0,
             33.0,
             0.0,
             20.0,
@@ -351,6 +359,18 @@ class FollowingRosTest(Node):
         self.band = 0.2
         self.min_wait_steps = int(5.0 / self.dt)
 
+        # Optional: gate the setpoint test until we see the first throttle command for veh_ego.
+        # Default OFF because it can deadlock if the MCU only publishes after seeing a nonzero setpoint.
+        self._test_started = not self.gate_on_first_throttle
+        self._test_started_step = None
+
+        # Startup instrumentation (one-time logs)
+        self._first_nonzero_sp_step = None
+        self._first_ego_throttle_step = None
+        self._first_ego_brake_step = None
+        self._first_ego_cmd_applied_step = None
+        self._last_mcu_age_log_step = None
+
         # Vehicle reset
         for v in self.vehicles:
             v.apply_control(carla.VehicleControl(throttle=0.0, brake=0.0))
@@ -365,11 +385,43 @@ class FollowingRosTest(Node):
         value = float(msg.data)
         if name in self._last_cmd:
             self._last_cmd[name]["throttle"] = value
+            now_s = time.perf_counter()
+            self._last_throttle_rx_wall_s[name] = now_s
+            self._last_cmd_rx_wall_s[name] = now_s
+            if name == "veh_ego" and self._first_ego_throttle_step is None:
+                self._first_ego_throttle_step = self.step
+                self.get_logger().info(
+                    f"First veh_ego throttle received at step={self.step} sim_t={self.sim_time:.3f}s value={value:.6f}"
+                )
+            if name == "veh_ego" and self.gate_on_first_throttle and not self._test_started:
+                self._test_started = True
+                self._test_started_step = self.step
+                self.last_change_step = self.step
+                self.last_change_speed = 0.0
+                self.get_logger().info(
+                    f"Test sequence enabled after first veh_ego throttle message (step={self.step})."
+                )
 
     def _brake_cb(self, msg: Float32, name: str) -> None:
         value = float(msg.data)
         if name in self._last_cmd:
             self._last_cmd[name]["brake"] = value
+            now_s = time.perf_counter()
+            self._last_brake_rx_wall_s[name] = now_s
+            self._last_cmd_rx_wall_s[name] = now_s
+            if name == "veh_ego" and self._first_ego_brake_step is None:
+                self._first_ego_brake_step = self.step
+                self.get_logger().info(
+                    f"First veh_ego brake received at step={self.step} sim_t={self.sim_time:.3f}s value={value:.6f}"
+                )
+
+    def _latest_cmd_pair_rx_wall_s(self, name: str):
+        """Return wall-time when a full (throttle+brake) pair was last received."""
+        t_th = self._last_throttle_rx_wall_s.get(name)
+        t_br = self._last_brake_rx_wall_s.get(name)
+        if t_th is None or t_br is None:
+            return None
+        return max(float(t_th), float(t_br))
 
     def _local_sp_cb(self, msg: Float32, name: str) -> None:
         value = float(msg.data)
@@ -499,8 +551,14 @@ class FollowingRosTest(Node):
             accels.append(accel)
             transforms.append(tf)
 
-        # Current global lead speed setpoint
-        sp = self.lead_speed_setpoints[self.lead_sp_idx]
+        # Current global lead speed setpoint.
+        # Optionally hold SP at 0 until first veh_ego throttle is received.
+        sp = self.lead_speed_setpoints[self.lead_sp_idx] if self._test_started else 0.0
+        if self._first_nonzero_sp_step is None and sp > 1e-6:
+            self._first_nonzero_sp_step = self.step
+            self.get_logger().info(
+                f"First nonzero platoon setpoint published at step={self.step} sim_t={self.sim_time:.3f}s sp={float(sp):.3f}"
+            )
         self.platoon_sp_pub.publish(Float32(data=float(sp)))
         if self._ego_setpoint_pub is not None:
             self._ego_setpoint_pub.publish(Float32(data=float(sp)))
@@ -537,8 +595,9 @@ class FollowingRosTest(Node):
             v = float(speeds[i])
             desired_dists.append(max(ms + 3.0, v * th + ms))
 
-        # Step logic to change lead SP when ego settles (matches Python script)
-        if self.plen > 1 and (self.step - self.last_change_step) >= self.min_wait_steps:
+        # Step logic to change lead SP when ego settles (matches Python script).
+        # Only start sequencing once the test is enabled (or if no MCU is used).
+        if (self._test_started or self.mcu_index is None) and self.plen > 1 and (self.step - self.last_change_step) >= self.min_wait_steps:
             ego_speed = float(speeds[self.ego_index])
             if abs(ego_speed - self.last_change_speed) <= self.band:
                 if self.lead_sp_idx == (len(self.lead_speed_setpoints) - 1):
@@ -581,10 +640,6 @@ class FollowingRosTest(Node):
         self.csv_writer.writerow(row)
         self.csv_file.flush()
 
-        self.get_logger().info(
-            f"Step {self.step}/{self.total_steps} t={self.sim_time:.2f}s SP={sp:.2f}"
-        )
-
         self.step += 1
 
     def apply_controls(self) -> None:
@@ -616,6 +671,32 @@ class FollowingRosTest(Node):
                 reverse=False,
             )
             v.apply_control(control)
+            cmd_pair_rx_s = self._latest_cmd_pair_rx_wall_s(name)
+            if cmd_pair_rx_s is not None:
+                self._last_applied_cmd_rx_wall_s[name] = cmd_pair_rx_s
+            if (
+                self.mcu_index is not None
+                and name == "veh_ego"
+                and (self.step % 50) == 0
+            ):
+                if self._last_mcu_age_log_step != self.step:
+                    self._last_mcu_age_log_step = self.step
+                    if cmd_pair_rx_s is None:
+                        self.get_logger().info("MCU cmd age: N/A (no throttle+brake received yet)")
+                    else:
+                        age_ms = (time.perf_counter() - float(cmd_pair_rx_s)) * 1000.0
+                        self.get_logger().info(f"MCU cmd age at apply: {age_ms:.2f} ms")
+            if (
+                self.mcu_index is not None
+                and name == "veh_ego"
+                and self._first_ego_cmd_applied_step is None
+                and (abs(throttle_cmd) > 1e-6 or abs(brake_cmd) > 1e-6)
+            ):
+                self._first_ego_cmd_applied_step = self.step
+                self.get_logger().info(
+                    f"First nonzero veh_ego control applied at step={self.step} sim_t={self.sim_time:.3f}s "
+                    f"throttle={throttle_cmd:.3f} brake={brake_cmd:.3f}"
+                )
 
     def shutdown(self) -> None:
         self.get_logger().info("Stopping vehicle and cleaning up...")
@@ -702,6 +783,17 @@ def main():
         default=1.0,
         help="Lane-keeping steering gain.",
     )
+    parser.add_argument(
+        "--wall-dt",
+        type=float,
+        default=None,
+        help="Optional wall-clock period per CARLA tick [s]. If unset, uses fixed_delta_seconds.",
+    )
+    parser.add_argument(
+        "--gate-on-first-throttle",
+        action="store_true",
+        help="Hold platoon setpoint at 0 until first veh_ego throttle is received (can deadlock if MCU waits for setpoint).",
+    )
     args = parser.parse_args()
 
     rclpy.init()
@@ -763,43 +855,47 @@ def main():
             if (time.perf_counter() - start) >= max_wall_s:
                 break
 
-    # Ensure CARLA does not tick faster than real-time dt (0.01s):
-    # one simulation tick (fixed_delta_seconds) should take >= dt wall time.
-    dt_wall_s = float(bridge.dt)
-    last_tick_wall_s = None
-    drain_budget_s = min(0.003, dt_wall_s * 0.30)
+    # Main simulation loop:
+    # - CARLA is synchronous with fixed_dt = 0.01s sim time.
+    # - Wall-time tick rate is capped to <= 1/dt to avoid overrunning the MCU.
+    # - Between ticks, we keep spinning ROS so serial/micro-ROS traffic is handled
+    #   promptly (reduces command latency vs. sleep-based pacing).
+    dt_wall_s = float(bridge.dt) if args.wall_dt is None else float(args.wall_dt)
+    state_delivery_budget_s = min(0.002, dt_wall_s * 0.25)
 
-    # Main simulation loop at 100 Hz sim time:
-    #  1) Apply controls from previous tick
-    #  2) Tick CARLA and publish state/setpoints/mode
-    #  3) Spin executor to deliver state to controllers
-    #  4) Run each PlatoonMember control step once (publish commands)
-    #  5) Spin executor to deliver commands back to bridge
+    # Prime with a safe initial control before first tick.
+    bridge.apply_controls()
+    tick_due_wall_s = time.perf_counter()
     try:
         while not bridge.finished:
-            if last_tick_wall_s is not None:
-                next_tick_wall_s = last_tick_wall_s + dt_wall_s
+            # Spin until the next tick boundary, but keep servicing ROS callbacks.
+            while True:
                 now_s = time.perf_counter()
-                if now_s < next_tick_wall_s:
-                    time.sleep(next_tick_wall_s - now_s)
+                remaining_s = tick_due_wall_s - now_s
+                if remaining_s <= 0.0:
+                    break
+                executor.spin_once(timeout_sec=remaining_s)
 
-            # 1) Apply controls just before advancing CARLA
+            tick_start_wall_s = time.perf_counter()
+
+            # Apply the latest known controls just before advancing CARLA.
             bridge.apply_controls()
 
-            # 2) Advance CARLA one synchronous step and publish state
+            # Advance CARLA one synchronous step and publish state.
             bridge.step_simulation()
-            last_tick_wall_s = time.perf_counter()
 
-            # 3) Deliver state and setpoint messages to PlatoonMember nodes
-            drain_executor(max_callbacks=500, max_wall_s=drain_budget_s)
+            # Deliver state and setpoint messages to PlatoonMember nodes promptly.
+            drain_executor(max_callbacks=500, max_wall_s=state_delivery_budget_s)
 
-            # 4) Run one control update per PlatoonMember (deterministic per-tick)
+            # Run one control update per PlatoonMember (deterministic per-tick).
             for n in nodes:
                 if isinstance(n, PlatoonMember):
                     n.step_once()
 
-            # 5) Deliver throttle/brake commands back to bridge subscribers
-            drain_executor(max_callbacks=500, max_wall_s=drain_budget_s)
+            # From here until the next tick boundary, keep spinning so:
+            # - Python controllers' command publishes reach the bridge subscribers
+            # - MCU (serial) command messages are received with minimal delay
+            tick_due_wall_s = tick_start_wall_s + dt_wall_s
     except KeyboardInterrupt:
         bridge.get_logger().info("KeyboardInterrupt: stopping test early.")
     finally:
