@@ -184,9 +184,15 @@ class FollowingRosTest(Node):
         self.initial_spacing = 6.0
 
         self.vehicles = []
+        
+        self.prev_speeds = [] # Previous speed for exponential smoothing low pass filter
+        
+        self.alpha = 1.0
 
         # Spawn platoon members
         for i in range(self.plen):
+
+            
             if i == 0:
                 ros_name = "veh_lead"
             elif self.mcu_index is not None and i == self.mcu_index:
@@ -209,6 +215,7 @@ class FollowingRosTest(Node):
 
             self.ros_names.append(ros_name)
             self.vehicles.append(veh)
+            self.prev_speeds.append(0.0)
 
             # Store spacing parameters (mirror of PlatoonMember construction)
             # so we can compute desired distances here for logging.
@@ -334,16 +341,17 @@ class FollowingRosTest(Node):
 
         # Lead speed setpoints (global platoon reference, m/s)
         self.lead_speed_setpoints = [
-            11.0,
-            33.0,
             0.0,
-            20.0,
-            25.0,
+            5.0,
+            10.0,
             15.0,
             10.0,
-            5.0,
-            15.0,
-            0.0,
+            21.0,
+            26.0,
+            21.0,
+            32.0,
+            36.0,
+            32.0,
         ]
 
         self.lead_sp_idx = 0
@@ -542,11 +550,17 @@ class FollowingRosTest(Node):
         speeds = []
         accels = []
         transforms = []
+        idx = 0
         for v in self.vehicles:
             vel = v.get_velocity()
             accel = v.get_acceleration()
             tf = v.get_transform()
-            speed = math.sqrt(vel.x ** 2 + vel.y ** 2 + vel.z ** 2)
+            # TODO low pass filter speed values, right now it is too noisy
+            speed_raw = math.sqrt(vel.x ** 2 + vel.y ** 2 + vel.z ** 2)
+            speed = self.alpha * speed_raw + ((1-self.alpha) * self.prev_speeds[idx])
+            self.prev_speeds[idx] = speed
+            idx += 1
+
             speeds.append(speed)
             accels.append(accel)
             transforms.append(tf)
