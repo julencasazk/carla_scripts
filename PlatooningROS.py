@@ -37,6 +37,7 @@ class PlatoonMember(Node):
         K_dist: float = 0.2,
         control_period: float = 0.05,
         platoon_id: str = "plat_0",
+        K_brake = 0.2,
     ):
         """
         role: "lead" or "follower"
@@ -55,6 +56,7 @@ class PlatoonMember(Node):
         self._desired_time_headway = desired_time_headway
         self._min_spacing = min_spacing
         self._K_dist = K_dist
+        self._K_brake = K_brake
 
         # State coming from topics
         self._speed = 0.0          # current vehicle speed [m/s]
@@ -321,7 +323,7 @@ class PlatoonMember(Node):
             brake = 0.0
         else:
             throttle = 0.0
-            brake = float(abs(u))
+            brake = self._K_brake * float(abs(u))
 
         # Lightweight periodic debug (helps diagnose "stuck at 0 throttle").
         self._dbg_print_idx += 1
