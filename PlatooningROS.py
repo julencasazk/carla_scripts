@@ -28,7 +28,7 @@ class PlatoonMember(Node):
     def __init__(
         self,
         name: str,
-        role: str,
+        platoon_index: int,
         slow_pid: PID,
         mid_pid: PID,
         fast_pid: PID,
@@ -40,16 +40,16 @@ class PlatoonMember(Node):
         K_brake = 0.2,
     ):
         """
-        role: "lead" or "follower"
-        For follower, a distance-based correction is applied to the speed setpoint.
+        platoon_index: 0 for leader, 1..N-1 for followers.
+        For followers, a distance-based correction is applied to the speed setpoint.
         """
         super().__init__(name)
 
-        # Use the provided logical vehicle name (e.g. "veh_lead")
+        # Use the provided logical vehicle name (e.g. "veh_0")
         # directly as the topic namespace so it matches the bridge
         # and micro-ROS firmware topic scheme.
         self._name = name
-        self._role = role
+        self._platoon_index = int(platoon_index)
         self._slow_pid = slow_pid
         self._mid_pid = mid_pid
         self._fast_pid = fast_pid
@@ -85,7 +85,7 @@ class PlatoonMember(Node):
         # Optional debug logging for timing/behavior (used mainly for leader)
         self._debug_step_idx = 0
         self._debug_writer = None
-        if self._role == "lead":
+        if self._platoon_index == 0:
             try:
                 import csv  # local import to avoid unused at module level
                 self._debug_log_file = open(f"{self._name}_debug.csv", mode="w", newline="")
@@ -123,7 +123,7 @@ class PlatoonMember(Node):
         # Subscriptions
         self._speed_sub = self.create_subscription(
             Float32,
-            f"{self._name}/state/speed",
+            f"/{self._name}/state/speed",
             self.speed_cb,
             qos_state,
         )
@@ -131,7 +131,7 @@ class PlatoonMember(Node):
         # ACC / local setpoint
         self._setpoint_sub = self.create_subscription(
             Float32,
-            f"{self._name}/state/setpoint",
+            f"/{self._name}/state/setpoint",
             self.setpoint_cb,
             qos_setpoint,
         )
@@ -139,7 +139,7 @@ class PlatoonMember(Node):
         # Distance to preceding vehicle
         self._dist_sub = self.create_subscription(
             Float32,
-            f"{self._name}/state/dist_to_veh",
+            f"/{self._name}/state/dist_to_veh",
             self.dist_to_veh_cb,
             qos_state,
         )
@@ -153,29 +153,29 @@ class PlatoonMember(Node):
         )
         self._platoon_mode_sub = self.create_subscription(
             Bool,
-            f"{self._name}/state/platoon_enabled",
+            f"/{self._name}/state/platoon_enabled",
             self.platoon_mode_cb,
             qos_setpoint,
         )
 
-        # Publishers (unchanged)
+        # Publishers
         self._throttle_pub = self.create_publisher(
             Float32,
-            f"{self._name}/command/throttle",
+            f"/{self._name}/command/throttle",
             qos_cmd,
         )
         self._brake_pub = self.create_publisher(
             Float32,
-            f"{self._name}/command/brake",
+            f"/{self._name}/command/brake",
             qos_cmd,
         )
-        
+
         self._local_sp_pub = self.create_publisher(
             Float32,
-            f"{self._name}/state/local_setpoint",
+            f"/{self._name}/state/local_setpoint",
             qos_state,
         )
-        
+
         # Timer-driven control loop by default. For fully deterministic
         # coupling to a simulator tick (e.g. CARLA 100 Hz), the caller can
         # disable this timer and invoke _control_loop or step_once() manually
@@ -207,8 +207,8 @@ class PlatoonMember(Node):
         Compute the effective speed setpoint for this member.
 
         Exact behavioral port of Platooning.py:
-          * lead: speed_sp = base_sp
-          * follower: speed_sp = base_sp + d_sp, where
+          * leader (index 0): speed_sp = base_sp
+          * follower (index > 0): speed_sp = base_sp + d_sp, where
               desired_dist = max(min_spacing + 3.0, v*T + min_spacing)
               dist_err = dist_to_veh - desired_dist
               d_sp = K*dist_err if dist_err >= 0 else 2*K*dist_err
@@ -228,8 +228,8 @@ class PlatoonMember(Node):
         # Store for debugging
         self._last_base_sp = base_sp
 
-        # Lead ignores distance logic (matches Platooning.py lead behavior).
-        if self._role == "lead":
+        # Leader ignores distance logic (matches Platooning.py lead behavior).
+        if self._platoon_index == 0:
             self._last_dist_err = 0.0
             self._last_eff_sp = base_sp
             return base_sp
@@ -327,7 +327,7 @@ class PlatoonMember(Node):
 
         # Lightweight periodic debug (helps diagnose "stuck at 0 throttle").
         self._dbg_print_idx += 1
-        if (self._dbg_print_idx % 500) == 0 and self._role == "lead":
+        if (self._dbg_print_idx % 500) == 0 and self._platoon_index == 0:
             try:
                 self.get_logger().info(
                     f"[{self._name}] v={speed_meas:.2f} base_sp={self._last_base_sp:.2f} "
@@ -352,7 +352,7 @@ class PlatoonMember(Node):
         '''
         # Debug printout so we can see what each vehicle is doing.
         self.get_logger().info(
-            f"[{self._name}] role={self._role} platoon={self._platoon_enabled} "
+            f"[{self._name}] idx={self._platoon_index} platoon={self._platoon_enabled} "
             f"v={self._speed:.2f} m/s dist={self._dist_to_veh:.2f} m "
             f"base_sp={self._last_base_sp:.2f} eff_sp={self._last_eff_sp:.2f} "
             f"throttle={throttle:.2f} brake={brake:.2f}"

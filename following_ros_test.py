@@ -87,11 +87,13 @@ class FollowingRosTest(Node):
 
         # Platoon configuration
         self.plen = int(args.plen)
-        # Optional MCU-controlled vehicle index. If set, that vehicle is named
-        # "veh_ego" and no Python PlatoonMember controller is spawned for it.
+        # Optional MCU-controlled vehicle index. If set, that vehicle uses the normal
+        # indexed name (veh_<idx>) and no Python PlatoonMember controller is spawned for it.
         self.mcu_index = int(args.mcu_index) if args.mcu_index is not None else None
         if self.mcu_index is not None and not (0 <= self.mcu_index < self.plen):
             raise ValueError("--mcu-index must be in [0, plen-1]")
+
+        self.mcu_ros_name = f"veh_{self.mcu_index}" if self.mcu_index is not None else None
 
         # index of ego vehicle for logging/dashcam:
         # - if MCU index provided, use that as ego
@@ -106,7 +108,7 @@ class FollowingRosTest(Node):
         self.speed_pubs = {}
         self.dist_pubs = {}
         self.platoon_mode_pubs = {}
-        self._ego_setpoint_pub = None
+        self._mcu_setpoint_pub = None
 
         # QoS profiles: match MCU expectations (BEST_EFFORT + VOLATILE everywhere).
         self.qos_state = QoSProfile(
@@ -192,13 +194,8 @@ class FollowingRosTest(Node):
         # Spawn platoon members
         for i in range(self.plen):
 
-            
-            if i == 0:
-                ros_name = "veh_lead"
-            elif self.mcu_index is not None and i == self.mcu_index:
-                ros_name = "veh_ego"
-            else:
-                ros_name = f"veh_{i}"
+            # Always use regular indexing for topic namespaces
+            ros_name = f"veh_{i}"
 
             spawn_tf = carla.Transform(
                 location=carla.Location(
@@ -222,26 +219,27 @@ class FollowingRosTest(Node):
             self._desired_time_headways[ros_name] = 0.7 if i == 1 else 0.3
             self._min_spacings[ros_name] = 7.5
 
-            # State publishers
+            # State publishers (absolute topics)
             self.speed_pubs[ros_name] = self.create_publisher(
-                Float32, f"{ros_name}/state/speed", self.qos_state
+                Float32, f"/{ros_name}/state/speed", self.qos_state
             )
             self.dist_pubs[ros_name] = self.create_publisher(
-                Float32, f"{ros_name}/state/dist_to_veh", self.qos_state
+                Float32, f"/{ros_name}/state/dist_to_veh", self.qos_state
             )
             self.platoon_mode_pubs[ros_name] = self.create_publisher(
-                Bool, f"{ros_name}/state/platoon_enabled", self.qos_setpoint
+                Bool, f"/{ros_name}/state/platoon_enabled", self.qos_setpoint
             )
             # Publish once (TRANSIENT_LOCAL) to avoid sending extra messages at 100 Hz.
             self.platoon_mode_pubs[ros_name].publish(Bool(data=True))
 
-            # MCU expects /veh_ego/state/setpoint (best effort). Only publish for veh_ego.
-            if ros_name == "veh_ego":
-                self._ego_setpoint_pub = self.create_publisher(
-                    Float32, f"{ros_name}/state/setpoint", self.qos_state
+            # MCU expects <veh_idx>/state/setpoint (best effort). Only publish for MCU index.
+            if self.mcu_index is not None and i == self.mcu_index:
+                self._mcu_setpoint_pub = self.create_publisher(
+                    Float32, f"/{ros_name}/state/setpoint", self.qos_state
                 )
 
-            # Command subscribers; controllers are PlatoonMember nodes
+            # Initialize command/state caches for this vehicle.
+            # Callbacks only accept messages for names present in these dicts.
             self._last_cmd[ros_name] = {"throttle": 0.0, "brake": 0.0}
             self._last_cmd_rx_wall_s[ros_name] = None
             self._last_throttle_rx_wall_s[ros_name] = None
@@ -249,26 +247,24 @@ class FollowingRosTest(Node):
             self._last_applied_cmd_rx_wall_s[ros_name] = None
             self._last_local_sp[ros_name] = 0.0
 
-            # MCU publishes commands as BEST_EFFORT; make subscriptions compatible.
-            cmd_qos = self.qos_state if ros_name == "veh_ego" else self.qos_cmd
+            # Command subscribers (absolute topics)
             self.create_subscription(
                 Float32,
-                f"{ros_name}/command/throttle",
+                f"/{ros_name}/command/throttle",
                 lambda msg, n=ros_name: self._throttle_cb(msg, n),
-                cmd_qos,
+                self.qos_cmd,
             )
             self.create_subscription(
                 Float32,
-                f"{ros_name}/command/brake",
+                f"/{ros_name}/command/brake",
                 lambda msg, n=ros_name: self._brake_cb(msg, n),
-                cmd_qos,
+                self.qos_cmd,
             )
 
-            # Local setpoint subscribers: each PlatoonMember publishes its
-            # own local speed setpoint on <name>/state/local_setpoint
+            # Local setpoint subscriber (absolute topic)
             self.create_subscription(
                 Float32,
-                f"{ros_name}/state/local_setpoint",
+                f"/{ros_name}/state/local_setpoint",
                 lambda msg, n=ros_name: self._local_sp_cb(msg, n),
                 self.qos_state,
             )
@@ -315,7 +311,7 @@ class FollowingRosTest(Node):
         # local_sp_<name>, dist_to_prev_<name>, desired_dist_<name>
         header = ["time_s"]
         for i, name in enumerate(self.ros_names):
-            suffix = "lead" if i == 0 else str(i)
+            suffix = str(i)
             header.extend([
                 f"throttle_{suffix}",
                 f"brake_{suffix}",
@@ -396,18 +392,20 @@ class FollowingRosTest(Node):
             now_s = time.perf_counter()
             self._last_throttle_rx_wall_s[name] = now_s
             self._last_cmd_rx_wall_s[name] = now_s
-            if name == "veh_ego" and self._first_ego_throttle_step is None:
+
+            if self.mcu_ros_name is not None and name == self.mcu_ros_name and self._first_ego_throttle_step is None:
                 self._first_ego_throttle_step = self.step
                 self.get_logger().info(
-                    f"First veh_ego throttle received at step={self.step} sim_t={self.sim_time:.3f}s value={value:.6f}"
+                    f"First MCU throttle received ({name}) at step={self.step} sim_t={self.sim_time:.3f}s value={value:.6f}"
                 )
-            if name == "veh_ego" and self.gate_on_first_throttle and not self._test_started:
+
+            if self.mcu_ros_name is not None and name == self.mcu_ros_name and self.gate_on_first_throttle and not self._test_started:
                 self._test_started = True
                 self._test_started_step = self.step
                 self.last_change_step = self.step
                 self.last_change_speed = 0.0
                 self.get_logger().info(
-                    f"Test sequence enabled after first veh_ego throttle message (step={self.step})."
+                    f"Test sequence enabled after first MCU throttle message ({name}) (step={self.step})."
                 )
 
     def _brake_cb(self, msg: Float32, name: str) -> None:
@@ -417,10 +415,10 @@ class FollowingRosTest(Node):
             now_s = time.perf_counter()
             self._last_brake_rx_wall_s[name] = now_s
             self._last_cmd_rx_wall_s[name] = now_s
-            if name == "veh_ego" and self._first_ego_brake_step is None:
+            if self.mcu_ros_name is not None and name == self.mcu_ros_name and self._first_ego_brake_step is None:
                 self._first_ego_brake_step = self.step
                 self.get_logger().info(
-                    f"First veh_ego brake received at step={self.step} sim_t={self.sim_time:.3f}s value={value:.6f}"
+                    f"First MCU brake received ({name}) at step={self.step} sim_t={self.sim_time:.3f}s value={value:.6f}"
                 )
 
     def _latest_cmd_pair_rx_wall_s(self, name: str):
@@ -574,8 +572,8 @@ class FollowingRosTest(Node):
                 f"First nonzero platoon setpoint published at step={self.step} sim_t={self.sim_time:.3f}s sp={float(sp):.3f}"
             )
         self.platoon_sp_pub.publish(Float32(data=float(sp)))
-        if self._ego_setpoint_pub is not None:
-            self._ego_setpoint_pub.publish(Float32(data=float(sp)))
+        if self._mcu_setpoint_pub is not None:
+            self._mcu_setpoint_pub.publish(Float32(data=float(sp)))
 
         # Publish per-vehicle state
         dists = []
@@ -689,8 +687,8 @@ class FollowingRosTest(Node):
             if cmd_pair_rx_s is not None:
                 self._last_applied_cmd_rx_wall_s[name] = cmd_pair_rx_s
             if (
-                self.mcu_index is not None
-                and name == "veh_ego"
+                self.mcu_ros_name is not None
+                and name == self.mcu_ros_name
                 and (self.step % 50) == 0
             ):
                 if self._last_mcu_age_log_step != self.step:
@@ -700,15 +698,16 @@ class FollowingRosTest(Node):
                     else:
                         age_ms = (time.perf_counter() - float(cmd_pair_rx_s)) * 1000.0
                         self.get_logger().info(f"MCU cmd age at apply: {age_ms:.2f} ms")
+
             if (
-                self.mcu_index is not None
-                and name == "veh_ego"
+                self.mcu_ros_name is not None
+                and name == self.mcu_ros_name
                 and self._first_ego_cmd_applied_step is None
                 and (abs(throttle_cmd) > 1e-6 or abs(brake_cmd) > 1e-6)
             ):
                 self._first_ego_cmd_applied_step = self.step
                 self.get_logger().info(
-                    f"First nonzero veh_ego control applied at step={self.step} sim_t={self.sim_time:.3f}s "
+                    f"First nonzero MCU control applied ({name}) at step={self.step} sim_t={self.sim_time:.3f}s "
                     f"throttle={throttle_cmd:.3f} brake={brake_cmd:.3f}"
                 )
 
@@ -772,7 +771,7 @@ def main():
         "--mcu-index",
         type=int,
         default=None,
-        help="Optional index [0..plen-1] of the MCU vehicle; names it 'veh_ego' and skips the Python controller for it.",
+        help="Optional index [0..plen-1] of the MCU vehicle (uses normal name veh_<idx>) and skips the Python controller for it.",
     )
     parser.add_argument(
         "--teleport-dist",
@@ -806,7 +805,7 @@ def main():
     parser.add_argument(
         "--gate-on-first-throttle",
         action="store_true",
-        help="Hold platoon setpoint at 0 until first veh_ego throttle is received (can deadlock if MCU waits for setpoint).",
+        help="Hold platoon setpoint at 0 until first MCU throttle is received (can deadlock if MCU waits for setpoint).",
     )
     args = parser.parse_args()
 
@@ -824,7 +823,7 @@ def main():
     for i, name in enumerate(bridge.ros_names):
         if bridge.mcu_index is not None and i == bridge.mcu_index:
             continue
-        role = "lead" if i == 0 else "follower"
+        platoon_index = i
 
         slow_pid = PID(0.43127789, 0.43676547, 0.0, 15.0, Ts, u_min, u_max, kb_aw, der_on_meas=True)
         mid_pid = PID(0.11675119, 0.085938,   0.0, 14.90530836, Ts, u_min, u_max, kb_aw, der_on_meas=True)
@@ -837,7 +836,7 @@ def main():
 
         member = PlatoonMember(
             name=name,
-            role=role,
+            platoon_index=platoon_index,
             slow_pid=slow_pid,
             mid_pid=mid_pid,
             fast_pid=fast_pid,
