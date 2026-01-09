@@ -94,6 +94,14 @@ class FollowingRosTest(Node):
         if self.mcu_index is not None and not (0 <= self.mcu_index < self.plen):
             raise ValueError("--mcu-index must be in [0, plen-1]")
 
+        # If no MCU is configured, do not gate the test waiting for an MCU throttle.
+        # This avoids a deadlock where the global setpoint stays at 0 forever.
+        if self.mcu_index is None and self.gate_on_first_throttle:
+            self.get_logger().warn(
+                "--gate-on-first-throttle ignored because no --mcu-index was provided; starting test immediately."
+            )
+            self.gate_on_first_throttle = False
+
         self.mcu_ros_name = f"veh_{self.mcu_index}" if self.mcu_index is not None else None
 
         # index of ego vehicle for logging/dashcam:
@@ -184,7 +192,7 @@ class FollowingRosTest(Node):
         vehicle_bp = bp_library.find("vehicle.tesla.model3")
 
         # Distance between vehicles at spawn so they don't collide immediately
-        self.initial_spacing = 6.0
+        self.initial_spacing = 15.0
 
         self.vehicles = []
         
@@ -218,8 +226,8 @@ class FollowingRosTest(Node):
             # First follower (second member) leaves more room as everyone receives a emergency stop
             # signal at the same time, but the leader must react itself before generating and sending
             # signal
-            self._desired_time_headways[ros_name] = 0.7 if i == 1 else 0.3
-            self._min_spacings[ros_name] = 7.5
+            self._desired_time_headways[ros_name] = 0.3 if i == 1 else 0.10
+            self._min_spacings[ros_name] = 4.0 
 
             # State publishers (absolute topics)
             self.speed_pubs[ros_name] = self.create_publisher(
@@ -345,18 +353,16 @@ class FollowingRosTest(Node):
 
         # Lead speed setpoints (global platoon reference, m/s)
         self.lead_speed_setpoints = [
-            15.55,
-            0.0,
-            22.22,
-            15.22,
-            33.33,
-            25,
-            0.0,
-            5.5,
-            2.5,
-            10.0,
-            12.5,
-            0.0
+            30.0,
+            30.0,
+            30.0,
+            30.0,
+            30.0,
+            30.0,
+            30.0,
+            30.0,
+            30.0,
+            30.0,
         ]
 
         self.lead_sp_idx = 0
@@ -593,7 +599,7 @@ class FollowingRosTest(Node):
                     new_loc = carla.Location(
                         x=target_loc.x,
                         y=target_loc.y,
-                        z=sp.location.z + 0.1,
+                        z=sp.location.z - 0.3,
                     )
                     v.set_transform(carla.Transform(location=new_loc, rotation=ref_rotation))
 
@@ -922,7 +928,7 @@ def main():
     parser.add_argument(
         "--teleport-dist",
         type=float,
-        default=250.0,
+        default=320.0,
         help="Teleport platoon back when leader travels this distance [m]; set <= 0 to disable.",
     )
     parser.add_argument(
@@ -951,7 +957,7 @@ def main():
     parser.add_argument(
         "--gate-on-first-throttle",
         action="store_true",
-        help="Hold platoon setpoint at 0 until first MCU throttle is received (can deadlock if MCU waits for setpoint).",
+        help="Hold platoon setpoint at 0 until first MCU throttle is received (ignored if --mcu-index is not set).",
     )
 
     # --- Leader disturbance injection: mild random brakes ---
@@ -969,7 +975,7 @@ def main():
     parser.add_argument(
         "--leader-brake-min-interval",
         type=float,
-        default=20.0,
+        default=30.0,
         help="Minimum time between leader brake pulses [s] (sim time).",
     )
     parser.add_argument(
@@ -987,13 +993,13 @@ def main():
     parser.add_argument(
         "--leader-brake-min-cmd",
         type=float,
-        default=0.05,
+        default=0.8,
         help="Minimum brake command for leader pulses [0..1].",
     )
     parser.add_argument(
         "--leader-brake-max-cmd",
         type=float,
-        default=0.15,
+        default=1.0,
         help="Maximum brake command for leader pulses [0..1].",
     )
     parser.add_argument(
@@ -1038,7 +1044,8 @@ def main():
             desired_time_headway=desired_time_headway,
             min_spacing=min_spacing,
             K_dist=1.0,
-            K_vel=0.5,
+            K_vel=1.0,
+            K_brake=2.0,
             control_period=Ts,
         )
 
