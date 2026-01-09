@@ -1,5 +1,6 @@
 import argparse
 import math
+import random
 import time
 import csv
 import threading
@@ -189,7 +190,7 @@ class FollowingRosTest(Node):
         
         self.prev_speeds = [] # Previous speed for exponential smoothing low pass filter
         
-        self.alpha = 1.0
+        self.alpha = 0.4
 
         # Spawn platoon members
         for i in range(self.plen):
@@ -214,8 +215,9 @@ class FollowingRosTest(Node):
             self.vehicles.append(veh)
             self.prev_speeds.append(0.0)
 
-            # Store spacing parameters (mirror of PlatoonMember construction)
-            # so we can compute desired distances here for logging.
+            # First follower (second member) leaves more room as everyone receives a emergency stop
+            # signal at the same time, but the leader must react itself before generating and sending
+            # signal
             self._desired_time_headways[ros_name] = 0.7 if i == 1 else 0.3
             self._min_spacings[ros_name] = 7.5
 
@@ -306,10 +308,10 @@ class FollowingRosTest(Node):
         self.csv_file = open(csv_filename, mode="w", newline="")
         self.csv_writer = csv.writer(self.csv_file)
 
-        # Build header: time_s, then for each vehicle a block of
+        # Build header: time_s, teleport_event (0/1), then for each vehicle a block of
         # throttle_<name>, brake_<name>, speed_<name>, accel_x_<name>,
-        # local_sp_<name>, dist_to_prev_<name>, desired_dist_<name>
-        header = ["time_s"]
+        # local_sp_<name>, dist_to_prev_<name>, desired_dist_<name>, dist_err_<name>, vel_diff_<name>, ttc_<name>
+        header = ["time_s", "teleport_event"]
         for i, name in enumerate(self.ros_names):
             suffix = str(i)
             header.extend([
@@ -320,10 +322,16 @@ class FollowingRosTest(Node):
                 f"local_sp_{suffix}",
                 f"dist_to_prev_{suffix}",
                 f"desired_dist_{suffix}",
+                f"dist_err_{suffix}",
+                f"vel_diff_{suffix}",
+                f"ttc_{suffix}",
             ])
         self.csv_writer.writerow(header)
         self.csv_file.flush()
         self.get_logger().info(f"Logging to: {csv_filename}")
+
+        # Teleport event flag (set to 1 only on the step teleport occurs).
+        self._teleport_event = 0
 
         # Step test definition (inspired by original platooning script)
         self.dt = settings.fixed_delta_seconds
@@ -337,17 +345,18 @@ class FollowingRosTest(Node):
 
         # Lead speed setpoints (global platoon reference, m/s)
         self.lead_speed_setpoints = [
+            15.55,
             0.0,
-            5.0,
+            22.22,
+            15.22,
+            33.33,
+            25,
+            0.0,
+            5.5,
+            2.5,
             10.0,
-            15.0,
-            10.0,
-            21.0,
-            26.0,
-            21.0,
-            32.0,
-            36.0,
-            32.0,
+            12.5,
+            0.0
         ]
 
         self.lead_sp_idx = 0
@@ -378,6 +387,49 @@ class FollowingRosTest(Node):
         # Vehicle reset
         for v in self.vehicles:
             v.apply_control(carla.VehicleControl(throttle=0.0, brake=0.0))
+
+        # --- Optional leader random brake injection (test disturbances) ---
+        # This is applied at the bridge level so it works whether the leader is
+        # controlled by a Python PlatoonMember or by an MCU.
+        self._leader_name = self.ros_names[0] if self.ros_names else "veh_0"
+        self._leader_brake_enabled = bool(getattr(args, "leader_random_brakes", False))
+        self._leader_brake_active = False
+        self._leader_brake_cmd = 0.0
+        self._leader_brake_end_s = 0.0
+        self._leader_next_brake_s = float("inf")
+        self._leader_rng = None
+
+        self._leader_brake_min_interval_s = float(getattr(args, "leader_brake_min_interval", 20.0))
+        self._leader_brake_max_interval_s = float(getattr(args, "leader_brake_max_interval", 60.0))
+        if self._leader_brake_max_interval_s < self._leader_brake_min_interval_s:
+            self._leader_brake_max_interval_s = self._leader_brake_min_interval_s
+        self._leader_brake_duration_s = float(getattr(args, "leader_brake_duration", 0.75))
+        self._leader_brake_min_cmd = float(getattr(args, "leader_brake_min_cmd", 0.05))
+        self._leader_brake_max_cmd = float(getattr(args, "leader_brake_max_cmd", 0.15))
+        if self._leader_brake_max_cmd < self._leader_brake_min_cmd:
+            self._leader_brake_max_cmd = self._leader_brake_min_cmd
+        self._leader_brake_min_speed_mps = float(getattr(args, "leader_brake_min_speed", 5.0))
+
+        # Cache of last computed speeds (set in step_simulation) so the injector
+        # doesn't need extra CARLA API calls.
+        self._last_speeds = None
+
+        if self._leader_brake_enabled:
+            seed = getattr(args, "leader_brake_seed", None)
+            if seed is None:
+                # Use wall-clock time for variability.
+                seed = int(time.time() * 1000.0) & 0xFFFFFFFF
+            self._leader_rng = random.Random(int(seed))
+            first_gap = self._leader_rng.uniform(self._leader_brake_min_interval_s, self._leader_brake_max_interval_s)
+            self._leader_next_brake_s = float(first_gap)
+            self.get_logger().info(
+                "Leader random brakes ENABLED: "
+                f"interval=[{self._leader_brake_min_interval_s:.1f},{self._leader_brake_max_interval_s:.1f}]s "
+                f"duration={self._leader_brake_duration_s:.2f}s "
+                f"cmd=[{self._leader_brake_min_cmd:.3f},{self._leader_brake_max_cmd:.3f}] "
+                f"min_speed={self._leader_brake_min_speed_mps:.2f} m/s "
+                f"seed={int(seed)}"
+            )
 
         self.get_logger().info(
             f"Running platoon step test (plen={self.plen}): dt={self.dt}s, total_time={self.total_time}s, total_steps={self.total_steps}"
@@ -490,6 +542,9 @@ class FollowingRosTest(Node):
 
     def step_simulation(self) -> None:
         """One synchronous CARLA step: tick world, publish state, update SP, log."""
+        # Reset event flag for this step; set to 1 only when teleport triggers below.
+        self._teleport_event = 0
+
         # Advance CARLA using controls that were applied just before this tick
         self.world.tick()
         snapshot = self.world.get_snapshot()
@@ -520,6 +575,7 @@ class FollowingRosTest(Node):
                     f"Teleport triggered: leader traveled {self.dist_since_tp_m:.2f} m "
                     f"(threshold {self.teleport_dist_m:.2f} m)"
                 )
+                self._teleport_event = 1
                 lead_tf = self.vehicles[0].get_transform()
                 base_tf = self._base_spawn_point
                 ref_rotation = base_tf.rotation
@@ -562,6 +618,9 @@ class FollowingRosTest(Node):
             speeds.append(speed)
             accels.append(accel)
             transforms.append(tf)
+
+        # Cache for use by the optional leader brake injector.
+        self._last_speeds = list(speeds)
 
         # Current global lead speed setpoint.
         # Optionally hold SP at 0 until first veh_ego throttle is received.
@@ -607,6 +666,34 @@ class FollowingRosTest(Node):
             v = float(speeds[i])
             desired_dists.append(max(ms + 3.0, v * th + ms))
 
+        # Compute additional spacing signals for debugging/tuning:
+        # - dist_err = dist_to_prev - desired_dist
+        # - vel_diff = v_prev - v_ego
+        # - ttc based on closing_speed = max(v_ego - v_prev, 0)
+        dist_errs = []
+        vel_diffs = []
+        ttcs = []
+        for i, name in enumerate(self.ros_names):
+            if i == 0:
+                dist_errs.append(0.0)
+                vel_diffs.append(0.0)
+                ttcs.append(float("inf"))
+                continue
+
+            dist_i = float(dists[i])
+            desired_i = float(desired_dists[i])
+            v_prev = float(speeds[i - 1])
+            v_ego = float(speeds[i])
+
+            dist_errs.append(dist_i - desired_i)
+            vel_diffs.append(v_prev - v_ego)
+
+            closing_speed = max(v_ego - v_prev, 0.0)
+            if dist_i > 0.0 and closing_speed > 0.1:
+                ttcs.append(dist_i / closing_speed)
+            else:
+                ttcs.append(float("inf"))
+
         # Step logic to change lead SP when ego settles (matches Python script).
         # Only start sequencing once the test is enabled (or if no MCU is used).
         if (self._test_started or self.mcu_index is None) and self.plen > 1 and (self.step - self.last_change_step) >= self.min_wait_steps:
@@ -627,8 +714,8 @@ class FollowingRosTest(Node):
                 self.last_change_speed = ego_speed
 
         # Logging to CSV: per-vehicle throttle, brake, speed, accel_x,
-        # local setpoint, distance to previous, desired distance
-        row = [f"{self.sim_time:.4f}"]
+        # local setpoint, distance to previous, desired distance, dist_err, vel_diff, ttc
+        row = [f"{self.sim_time:.4f}", str(int(self._teleport_event))]
         for i, name in enumerate(self.ros_names):
             cmd = self._last_cmd.get(name, {"throttle": 0.0, "brake": 0.0})
             throttle = float(cmd["throttle"])
@@ -638,6 +725,9 @@ class FollowingRosTest(Node):
             local_sp = float(self._last_local_sp.get(name, sp))
             dist_i = float(dists[i])
             desired_dist_i = float(desired_dists[i])
+            dist_err_i = float(dist_errs[i])
+            vel_diff_i = float(vel_diffs[i])
+            ttc_i = float(ttcs[i])
 
             row.extend([
                 f"{throttle:.4f}",
@@ -647,6 +737,9 @@ class FollowingRosTest(Node):
                 f"{local_sp:.4f}",
                 f"{dist_i:.4f}",
                 f"{desired_dist_i:.4f}",
+                f"{dist_err_i:.4f}",
+                f"{vel_diff_i:.4f}",
+                f"{ttc_i:.4f}",
             ])
 
         self.csv_writer.writerow(row)
@@ -665,6 +758,59 @@ class FollowingRosTest(Node):
             cmd = self._last_cmd.get(name, {"throttle": 0.0, "brake": 0.0})
             throttle_cmd = max(0.0, min(1.0, float(cmd["throttle"])))
             brake_cmd = max(0.0, min(1.0, float(cmd["brake"])))
+
+            # Optional: inject mild random brake pulses on the leader.
+            if self._leader_brake_enabled and name == self._leader_name and self._leader_rng is not None:
+                sim_t = float(self.sim_time)
+                leader_speed = None
+                try:
+                    if self._last_speeds is not None and len(self._last_speeds) > 0:
+                        leader_speed = float(self._last_speeds[0])
+                except Exception:
+                    leader_speed = None
+
+                # End an active pulse.
+                if self._leader_brake_active and sim_t >= float(self._leader_brake_end_s):
+                    self._leader_brake_active = False
+                    self._leader_brake_cmd = 0.0
+                    gap = self._leader_rng.uniform(
+                        float(self._leader_brake_min_interval_s),
+                        float(self._leader_brake_max_interval_s),
+                    )
+                    self._leader_next_brake_s = sim_t + float(gap)
+                    self.get_logger().info(
+                        f"Leader random brake END at t={sim_t:.2f}s; next in {gap:.1f}s"
+                    )
+
+                # Start a new pulse if conditions are met.
+                if (
+                    (not self._leader_brake_active)
+                    and self._test_started
+                    and sim_t >= float(self._leader_next_brake_s)
+                    and (leader_speed is None or leader_speed >= float(self._leader_brake_min_speed_mps))
+                ):
+                    self._leader_brake_active = True
+                    self._leader_brake_cmd = float(
+                        self._leader_rng.uniform(
+                            float(self._leader_brake_min_cmd),
+                            float(self._leader_brake_max_cmd),
+                        )
+                    )
+                    self._leader_brake_end_s = sim_t + float(self._leader_brake_duration_s)
+                    self.get_logger().info(
+                        f"Leader random brake START at t={sim_t:.2f}s cmd={self._leader_brake_cmd:.3f} "
+                        f"duration={self._leader_brake_duration_s:.2f}s"
+                    )
+
+                if self._leader_brake_active:
+                    throttle_cmd = 0.0
+                    brake_cmd = max(float(brake_cmd), float(self._leader_brake_cmd))
+                    # Keep logging consistent with what's actually applied.
+                    try:
+                        self._last_cmd[name]["throttle"] = float(throttle_cmd)
+                        self._last_cmd[name]["brake"] = float(brake_cmd)
+                    except Exception:
+                        pass
 
             steer_cmd = 0.0
             if getattr(self.args, "lane_keep", False):
@@ -807,6 +953,55 @@ def main():
         action="store_true",
         help="Hold platoon setpoint at 0 until first MCU throttle is received (can deadlock if MCU waits for setpoint).",
     )
+
+    # --- Leader disturbance injection: mild random brakes ---
+    parser.add_argument(
+        "--leader-random-brakes",
+        action="store_true",
+        help="Inject infrequent mild brake pulses on the leader (veh_0) to test follower response.",
+    )
+    parser.add_argument(
+        "--leader-brake-seed",
+        type=int,
+        default=None,
+        help="Random seed for leader brake events (default: derived from wall-clock time).",
+    )
+    parser.add_argument(
+        "--leader-brake-min-interval",
+        type=float,
+        default=20.0,
+        help="Minimum time between leader brake pulses [s] (sim time).",
+    )
+    parser.add_argument(
+        "--leader-brake-max-interval",
+        type=float,
+        default=60.0,
+        help="Maximum time between leader brake pulses [s] (sim time).",
+    )
+    parser.add_argument(
+        "--leader-brake-duration",
+        type=float,
+        default=0.75,
+        help="Duration of each leader brake pulse [s] (sim time).",
+    )
+    parser.add_argument(
+        "--leader-brake-min-cmd",
+        type=float,
+        default=0.05,
+        help="Minimum brake command for leader pulses [0..1].",
+    )
+    parser.add_argument(
+        "--leader-brake-max-cmd",
+        type=float,
+        default=0.15,
+        help="Maximum brake command for leader pulses [0..1].",
+    )
+    parser.add_argument(
+        "--leader-brake-min-speed",
+        type=float,
+        default=5.0,
+        help="Only inject leader brake pulses when leader speed is at least this value [m/s].",
+    )
     args = parser.parse_args()
 
     rclpy.init()
@@ -842,7 +1037,8 @@ def main():
             fast_pid=fast_pid,
             desired_time_headway=desired_time_headway,
             min_spacing=min_spacing,
-            K_dist=2.5,
+            K_dist=1.0,
+            K_vel=0.5,
             control_period=Ts,
         )
 

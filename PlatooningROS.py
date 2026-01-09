@@ -35,9 +35,10 @@ class PlatoonMember(Node):
         desired_time_headway: float = 0.5,
         min_spacing: float = 5.0,
         K_dist: float = 0.2,
+        K_vel: float = 1.0,
         control_period: float = 0.05,
         platoon_id: str = "plat_0",
-        K_brake = 0.2,
+        K_brake = 1.0,
     ):
         """
         platoon_index: 0 for leader, 1..N-1 for followers.
@@ -56,12 +57,16 @@ class PlatoonMember(Node):
         self._desired_time_headway = desired_time_headway
         self._min_spacing = min_spacing
         self._K_dist = K_dist
+        self._K_vel = K_vel
         self._K_brake = K_brake
+
+        self._control_period = float(control_period)
 
         # State coming from topics
         self._speed = 0.0          # current vehicle speed [m/s]
         self._setpoint = 0.0       # local ACC speed setpoint [m/s]
         self._dist_to_veh = 0.0    # distance to preceding vehicle [m]
+        self._preceding_speed = 0.0 
 
         self._last_setpoint = 0.0  # Setpoint saving to avoid collisions when slowing down
 
@@ -73,6 +78,56 @@ class PlatoonMember(Node):
         self._last_base_sp = 0.0
         self._last_eff_sp = 0.0
         self._last_dist_err = 0.0
+        self._last_vel_diff = 0.0
+
+        # Brake supervisor state/params
+        self._brake_active = False
+        self._brake_cmd_prev = 0.0
+
+        # Throttle PID setpoint smoothing (prevents a throttle jump after braking)
+        self._pid_speed_sp = 0.0
+        self._pid_speed_sp_init = False
+        # Limit how fast the PID setpoint can rise/fall [m/s^2]
+        self._pid_sp_rate_up = 5.0
+        self._pid_sp_rate_down = 10.0
+
+        # Defaults chosen to be conservative and avoid chatter.
+        self._brake_enable = True
+        self._brake_deadband = 0.02
+        self._brake_rate_limit = 1.0  # brake units per second
+
+        # Hardcoded per-range brake calibration from CARLA test
+        #
+        # Mapping: desired_decel (m/s^2, positive magnitude) -> brake_cmd [0..1]
+        # using linear interpolation between (min_decel -> min_brake)
+        # and (max_decel -> max_brake).
+        self._low_min_decel = 1.0
+        self._low_max_decel = 5.0
+        self._low_min_brake = 0.05
+        self._low_max_brake = 0.50
+
+        self._mid_min_decel = 1.0
+        self._mid_max_decel = 6.0
+        self._mid_min_brake = 0.05
+        self._mid_max_brake = 0.50
+
+        self._high_min_decel = 1.0
+        self._high_max_decel = 8.0
+        self._high_min_brake = 0.05
+        self._high_max_brake = 0.50
+
+        # Gates / hysteresis
+        self._dist_on = 1.0
+        self._dist_off = 0.5
+        self._ttc_on = 2.5
+        self._ttc_off = 3.2
+        self._v_margin_on = 0.5
+        self._v_margin_off = 0.2
+
+        # Decel targets (magnitudes, m/s^2)
+        self._decel_mild = 1.0
+        self._decel_mod = 2.5
+        self._decel_full = 5.0
 
         # Speed-range scheduling (matches Platooning.py thresholds)
         self._v1 = 11.11
@@ -158,6 +213,14 @@ class PlatoonMember(Node):
             qos_setpoint,
         )
 
+        if self._platoon_index > 0: 
+            self._preceding_speed_sub = self.create_subscription(
+                Float32,
+                f"/veh_{self._platoon_index - 1}/state/speed",
+                self.preceding_speed_cb,
+                qos_setpoint,
+            )
+
         # Publishers
         self._throttle_pub = self.create_publisher(
             Float32,
@@ -176,11 +239,44 @@ class PlatoonMember(Node):
             qos_state,
         )
 
+
         # Timer-driven control loop by default. For fully deterministic
         # coupling to a simulator tick (e.g. CARLA 100 Hz), the caller can
         # disable this timer and invoke _control_loop or step_once() manually
         # once per simulation step.
         self._timer = self.create_timer(control_period, self._control_loop)
+
+    def _decel_to_brake(self, speed_range: str, desired_decel: float) -> float:
+        """Linear decel->brake mapping using hardcoded per-range constants."""
+        if desired_decel <= 0.0:
+            return 0.0
+
+        if speed_range == "high":
+            min_d, max_d = float(self._high_min_decel), float(self._high_max_decel)
+            min_b, max_b = float(self._high_min_brake), float(self._high_max_brake)
+        elif speed_range == "mid":
+            min_d, max_d = float(self._mid_min_decel), float(self._mid_max_decel)
+            min_b, max_b = float(self._mid_min_brake), float(self._mid_max_brake)
+        else:
+            min_d, max_d = float(self._low_min_decel), float(self._low_max_decel)
+            min_b, max_b = float(self._low_min_brake), float(self._low_max_brake)
+
+        if max_d <= min_d:
+            return 0.0
+        if max_b <= min_b:
+            return max(0.0, min(1.0, min_b))
+
+        if desired_decel <= min_d:
+            cmd = min_b
+        elif desired_decel >= max_d:
+            cmd = max_b
+        else:
+            t = (desired_decel - min_d) / (max_d - min_d)
+            cmd = min_b + t * (max_b - min_b)
+
+        # Optional global gain
+        cmd = float(self._K_brake) * float(cmd)
+        return max(0.0, min(1.0, cmd))
 
     # --- Callbacks for state topics ---
 
@@ -199,6 +295,9 @@ class PlatoonMember(Node):
 
     def platoon_mode_cb(self, msg: Bool):
         self._platoon_enabled = bool(msg.data)
+
+    def preceding_speed_cb(self, msg: Float32):
+        self._preceding_speed = float(msg.data)
 
     # --- Core control logic (CARLA-agnostic) ---
 
@@ -240,21 +339,50 @@ class PlatoonMember(Node):
             self._last_eff_sp = base_sp
             return base_sp
 
-        desired_dist = max(
-            self._min_spacing + 3.0,
-            speed * self._desired_time_headway + self._min_spacing,
-        )
-        dist_err = self._dist_to_veh - desired_dist
-        self._last_dist_err = dist_err
+        desired_dist, dist_err, vel_diff, _, _ = self._compute_spacing_signals()
+        
 
         if dist_err >= 0.0:
-            d_sp = self._K_dist * dist_err
+            d_sp = self._K_dist * dist_err + self._K_vel * vel_diff
         else:
-            d_sp = 2.0 * self._K_dist * dist_err
+            d_sp = 4.0 * self._K_dist * dist_err + self._K_vel * vel_diff
 
-        eff_sp = base_sp + d_sp
+        eff_sp = min(base_sp + d_sp, 33.33)
+        eff_sp = max(eff_sp, 0.0)
         self._last_eff_sp = eff_sp
         return eff_sp
+
+    def _compute_spacing_signals(self):
+        """Compute spacing-related signals shared by setpoint and braking logic.
+
+        Returns: (desired_dist, dist_err, vel_diff, closing_speed, ttc)
+        - desired_dist: m
+        - dist_err: d - desired_dist (m)
+        - vel_diff: v_lead - v_ego (m/s)
+        - closing_speed: max(v_ego - v_lead, 0) (m/s)
+        - ttc: s (inf if not closing or invalid)
+        """
+        speed = float(self._speed)
+        dist = float(self._dist_to_veh)
+
+        desired_dist = max(
+            float(self._min_spacing) + 3.0,
+            speed * float(self._desired_time_headway) + float(self._min_spacing),
+        )
+        dist_err = dist - desired_dist
+
+        # Lead speed can be missing early; treat as equal speed (no closing).
+        v_lead = float(self._preceding_speed) if self._preceding_speed is not None else speed
+        vel_diff = v_lead - speed
+        closing_speed = max(speed - v_lead, 0.0)
+        if dist > 0.0 and closing_speed > 0.1:
+            ttc = dist / closing_speed
+        else:
+            ttc = float("inf")
+
+        self._last_dist_err = float(dist_err)
+        self._last_vel_diff = float(vel_diff)
+        return float(desired_dist), float(dist_err), float(vel_diff), float(closing_speed), float(ttc)
 
     def _select_pid(self) -> PID:
         if self._current_range == "high":
@@ -294,6 +422,27 @@ class PlatoonMember(Node):
         speed_sp = self.compute_speed_setpoint()
         speed_meas = self._speed
 
+        # Smooth the setpoint used by the throttle PID to avoid a big step
+        # when braking stops.
+        if not self._pid_speed_sp_init:
+            self._pid_speed_sp = float(speed_sp)
+            self._pid_speed_sp_init = True
+
+        # While braking is active, force the PID setpoint not to jump above
+        # current speed (avoids winding up throttle demand behind the scenes).
+        if self._brake_active:
+            pid_sp_target = min(float(speed_sp), float(speed_meas))
+        else:
+            pid_sp_target = float(speed_sp)
+
+        dt = max(float(self._control_period), 1e-3)
+        max_up = float(self._pid_sp_rate_up) * dt
+        max_dn = float(self._pid_sp_rate_down) * dt
+        if pid_sp_target > self._pid_speed_sp:
+            self._pid_speed_sp = min(self._pid_speed_sp + max_up, pid_sp_target)
+        else:
+            self._pid_speed_sp = max(self._pid_speed_sp - max_dn, pid_sp_target)
+
         # Debug: for the leader, log each control step with wall time and
         # key signals so we can inspect effective timing and behavior.
         if self._debug_writer is not None:
@@ -316,14 +465,17 @@ class PlatoonMember(Node):
 
         if self._update_speed_range(speed_meas):
             self._reset_selected_pid()
-        u = self._select_pid().step(speed_sp, speed_meas)
 
-        if u > 0.0:
-            throttle = float(u)
-            brake = 0.0
-        else:
-            throttle = 0.0
-            brake = self._K_brake * float(abs(u))
+        # Throttle-only speed PID (no direct braking from negative u)
+        u = float(self._select_pid().step(float(self._pid_speed_sp), speed_meas))
+        throttle_cmd = max(0.0, min(1.0, u))
+
+        brake_cmd = float(self.compute_brake(speed_sp=speed_sp, throttle_req=throttle_cmd))
+        if brake_cmd > 0.0:
+            throttle_cmd = 0.0
+            # Keep PID setpoint from running away while we're braking.
+            self._pid_speed_sp = min(float(self._pid_speed_sp), float(speed_meas))
+
 
         # Lightweight periodic debug (helps diagnose "stuck at 0 throttle").
         self._dbg_print_idx += 1
@@ -332,12 +484,86 @@ class PlatoonMember(Node):
                 self.get_logger().info(
                     f"[{self._name}] v={speed_meas:.2f} base_sp={self._last_base_sp:.2f} "
                     f"platoon_sp={self._platoon_sp:.2f} enabled={self._platoon_enabled} "
-                    f"u={u:.3f} th={throttle:.3f} br={brake:.3f}"
+                    f"th={throttle_cmd:.3f} br={brake_cmd:.3f}"
                 )
             except Exception:
                 pass
 
-        return throttle, brake, speed_sp
+        # Publish the setpoint that the throttle PID is actually using.
+        return throttle_cmd, brake_cmd, float(self._pid_speed_sp)
+    
+    def compute_brake(self, speed_sp: float, throttle_req: float) -> float:
+        """Brake supervisor.
+
+        - Uses distance/TTC/overspeed gates to decide when braking is needed.
+        - Uses a hardcoded per-range decel->brake linear mapping.
+        - Applies hysteresis and rate limiting to avoid chatter.
+        """
+        if not self._brake_enable:
+            return 0.0
+
+        v = float(self._speed)
+        d = float(self._dist_to_veh)
+        desired_dist, dist_err, vel_diff, closing_speed, ttc = self._compute_spacing_signals()
+
+        # Determine speed bin using the same range scheduler.
+        bin_name = self._current_range
+
+        # --- Gate evaluation ---
+        too_close_on = (self._platoon_index > 0) and (d > 0.0) and (dist_err < -float(self._dist_on))
+        too_close_off = (self._platoon_index > 0) and (d > 0.0) and (dist_err < -float(self._dist_off))
+
+        ttc_on = (self._platoon_index > 0) and (ttc < float(self._ttc_on))
+        ttc_off = (self._platoon_index > 0) and (ttc < float(self._ttc_off))
+
+        # Overspeed brake gate: only if we're above speed_sp and already asking for near-zero throttle.
+        overspeed = v - float(speed_sp)
+        overspeed_on = (overspeed > float(self._v_margin_on)) and (throttle_req <= 0.05)
+        overspeed_off = (overspeed > float(self._v_margin_off)) and (throttle_req <= 0.05)
+
+        if not self._brake_active:
+            want_brake = bool(too_close_on or ttc_on or overspeed_on)
+        else:
+            want_brake = bool(too_close_off or ttc_off or overspeed_off)
+
+        # If braking is not desired, ramp down with rate limit.
+        if not want_brake:
+            self._brake_active = False
+            target = 0.0
+        else:
+            if not self._brake_active:
+                self._brake_active = True
+                # Reset PID integrator when we start braking to avoid a throttle kick when releasing.
+                self._reset_selected_pid()
+
+            # 3-level severity:
+            # - mild: overspeed only
+            # - moderate: normal closing / too-close gate
+            # - full: urgent (very low TTC or very negative distance error)
+            if too_close_on or ttc_on:
+                # Upgrade to full only when it's clearly urgent.
+                if (ttc < 1.2) or (dist_err < -2.0):
+                    desired_decel = float(self._decel_full)
+                else:
+                    desired_decel = float(self._decel_mod)
+            else:
+                desired_decel = float(self._decel_mild)
+
+            target = self._decel_to_brake(speed_range=bin_name, desired_decel=desired_decel)
+
+        # Rate limit
+        max_step = float(self._brake_rate_limit) * max(self._control_period, 1e-3)
+        lo = self._brake_cmd_prev - max_step
+        hi = self._brake_cmd_prev + max_step
+        cmd = max(lo, min(hi, target))
+
+        # Deadband near zero
+        if cmd < float(self._brake_deadband) and not self._brake_active:
+            cmd = 0.0
+
+        cmd = max(0.0, min(1.0, float(cmd)))
+        self._brake_cmd_prev = cmd
+        return cmd
 
     def _control_loop(self):
         """
