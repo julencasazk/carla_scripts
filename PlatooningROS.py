@@ -6,15 +6,18 @@ This node:
       <name>/state/speed       : Float32, current ego speed [m/s]
       <name>/state/setpoint    : Float32, base (global) speed setpoint [m/s]
       <name>/state/dist_to_veh : Float32, distance to preceding vehicle [m]
+      <name>/state/desired_decel : Float32, predecessor cooperative braking intent [m/s^2] (positive magnitude)
   * Publishes:
       <name>/command/throttle  : Float32, [0..1]
       <name>/command/brake     : Float32, [0..1]
+      <name>/state/desired_decel : Float32, this vehicle cooperative braking intent [m/s^2] (positive magnitude)
 
 All vehicle and simulator specifics (e.g. CARLA VehicleControl, transforms)
 must be handled in a separate bridge node.
 """
 
 import math
+import time
 
 import rclpy
 from rclpy.node import Node
@@ -129,6 +132,16 @@ class PlatoonMember(Node):
         self._decel_mod = 2.5
         self._decel_full = 5.0
 
+        # Cooperative braking intent (desired decel magnitude, m/s^2)
+        self._desired_decel = 0.0
+        self._preceding_desired_decel = 0.0
+        self._preceding_desired_decel_rx_t = None  # monotonic time when last message arrived
+        self._coop_enable = True
+        self._coop_timeout_s = 0.30
+        self._coop_gain = 2.0
+        self._coop_decel_on = 0.20
+        self._coop_decel_off = 0.10
+
         # Speed-range scheduling (matches Platooning.py thresholds)
         self._v1 = 11.11
         self._v2 = 22.22
@@ -221,6 +234,13 @@ class PlatoonMember(Node):
                 qos_setpoint,
             )
 
+            self._preceding_desired_decel_sub = self.create_subscription(
+                Float32,
+                f"/veh_{self._platoon_index - 1}/state/desired_decel",
+                self.preceding_desired_decel_cb,
+                qos_setpoint,
+            )
+
         # Publishers
         self._throttle_pub = self.create_publisher(
             Float32,
@@ -236,6 +256,12 @@ class PlatoonMember(Node):
         self._local_sp_pub = self.create_publisher(
             Float32,
             f"/{self._name}/state/local_setpoint",
+            qos_state,
+        )
+
+        self._desired_decel_pub = self.create_publisher(
+            Float32,
+            f"/{self._name}/state/desired_decel",
             qos_state,
         )
 
@@ -298,6 +324,24 @@ class PlatoonMember(Node):
 
     def preceding_speed_cb(self, msg: Float32):
         self._preceding_speed = float(msg.data)
+
+    def preceding_desired_decel_cb(self, msg: Float32):
+        # Cooperative braking intent is a positive decel magnitude [m/s^2].
+        d = float(msg.data)
+        self._preceding_desired_decel = max(0.0, d)
+        self._preceding_desired_decel_rx_t = time.monotonic()
+
+    def _fresh_preceding_desired_decel(self) -> float:
+        if not self._coop_enable:
+            return 0.0
+        if self._platoon_index <= 0:
+            return 0.0
+        if self._preceding_desired_decel_rx_t is None:
+            return 0.0
+        age = time.monotonic() - float(self._preceding_desired_decel_rx_t)
+        if age > float(self._coop_timeout_s):
+            return 0.0
+        return max(0.0, float(self._preceding_desired_decel))
 
     # --- Core control logic (CARLA-agnostic) ---
 
@@ -422,26 +466,8 @@ class PlatoonMember(Node):
         speed_sp = self.compute_speed_setpoint()
         speed_meas = self._speed
 
-        # Smooth the setpoint used by the throttle PID to avoid a big step
-        # when braking stops.
-        if not self._pid_speed_sp_init:
-            self._pid_speed_sp = float(speed_sp)
-            self._pid_speed_sp_init = True
-
-        # While braking is active, force the PID setpoint not to jump above
-        # current speed (avoids winding up throttle demand behind the scenes).
-        if self._brake_active:
-            pid_sp_target = min(float(speed_sp), float(speed_meas))
-        else:
-            pid_sp_target = float(speed_sp)
-
-        dt = max(float(self._control_period), 1e-3)
-        max_up = float(self._pid_sp_rate_up) * dt
-        max_dn = float(self._pid_sp_rate_down) * dt
-        if pid_sp_target > self._pid_speed_sp:
-            self._pid_speed_sp = min(self._pid_speed_sp + max_up, pid_sp_target)
-        else:
-            self._pid_speed_sp = max(self._pid_speed_sp - max_dn, pid_sp_target)
+        # NOTE: For step-response testing, feed the raw effective setpoint
+        # directly to the speed PID (no internal setpoint ramping).
 
         # Debug: for the leader, log each control step with wall time and
         # key signals so we can inspect effective timing and behavior.
@@ -467,14 +493,12 @@ class PlatoonMember(Node):
             self._reset_selected_pid()
 
         # Throttle-only speed PID (no direct braking from negative u)
-        u = float(self._select_pid().step(float(self._pid_speed_sp), speed_meas))
+        u = float(self._select_pid().step(float(speed_sp), speed_meas))
         throttle_cmd = max(0.0, min(1.0, u))
 
         brake_cmd = float(self.compute_brake(speed_sp=speed_sp, throttle_req=throttle_cmd))
         if brake_cmd > 0.0:
             throttle_cmd = 0.0
-            # Keep PID setpoint from running away while we're braking.
-            self._pid_speed_sp = min(float(self._pid_speed_sp), float(speed_meas))
 
 
         # Lightweight periodic debug (helps diagnose "stuck at 0 throttle").
@@ -489,8 +513,8 @@ class PlatoonMember(Node):
             except Exception:
                 pass
 
-        # Publish the setpoint that the throttle PID is actually using.
-        return throttle_cmd, brake_cmd, float(self._pid_speed_sp)
+        # Publish the effective (unramped) setpoint.
+        return throttle_cmd, brake_cmd, float(speed_sp)
     
     def compute_brake(self, speed_sp: float, throttle_req: float) -> float:
         """Brake supervisor.
@@ -521,33 +545,45 @@ class PlatoonMember(Node):
         overspeed_on = (overspeed > float(self._v_margin_on)) and (throttle_req <= 0.05)
         overspeed_off = (overspeed > float(self._v_margin_off)) and (throttle_req <= 0.05)
 
+        # Cooperative braking feedforward (from predecessor), with receiver-side freshness.
+        ff_decel = float(self._fresh_preceding_desired_decel())
+        ff_on = ff_decel >= float(self._coop_decel_on)
+        ff_off = ff_decel >= float(self._coop_decel_off)
+
         if not self._brake_active:
-            want_brake = bool(too_close_on or ttc_on or overspeed_on)
+            want_brake = bool(too_close_on or ttc_on or overspeed_on or ff_on)
         else:
-            want_brake = bool(too_close_off or ttc_off or overspeed_off)
+            want_brake = bool(too_close_off or ttc_off or overspeed_off or ff_off)
 
         # If braking is not desired, ramp down with rate limit.
         if not want_brake:
             self._brake_active = False
             target = 0.0
+            self._desired_decel = 0.0
         else:
             if not self._brake_active:
                 self._brake_active = True
                 # Reset PID integrator when we start braking to avoid a throttle kick when releasing.
                 self._reset_selected_pid()
 
-            # 3-level severity:
+            # Local 3-level severity (feedback):
             # - mild: overspeed only
             # - moderate: normal closing / too-close gate
             # - full: urgent (very low TTC or very negative distance error)
             if too_close_on or ttc_on:
                 # Upgrade to full only when it's clearly urgent.
                 if (ttc < 1.2) or (dist_err < -2.0):
-                    desired_decel = float(self._decel_full)
+                    fb_decel = float(self._decel_full)
                 else:
-                    desired_decel = float(self._decel_mod)
+                    fb_decel = float(self._decel_mod)
+            elif overspeed_on or overspeed_off:
+                fb_decel = float(self._decel_mild)
             else:
-                desired_decel = float(self._decel_mild)
+                fb_decel = 0.0
+
+            # Cooperative braking arbitration (feedforward can only add braking).
+            desired_decel = max(float(fb_decel), float(self._coop_gain) * float(ff_decel))
+            self._desired_decel = float(desired_decel)
 
             target = self._decel_to_brake(speed_range=bin_name, desired_decel=desired_decel)
 
@@ -574,6 +610,7 @@ class PlatoonMember(Node):
         self._throttle_pub.publish(Float32(data=throttle))
         self._brake_pub.publish(Float32(data=brake))
         self._local_sp_pub.publish(Float32(data=speed_sp))
+        self._desired_decel_pub.publish(Float32(data=self._desired_decel))
 
         '''
         # Debug printout so we can see what each vehicle is doing.
