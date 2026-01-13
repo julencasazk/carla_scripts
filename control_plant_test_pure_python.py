@@ -4,7 +4,7 @@ import control as ctl
 from PID import PID
 
 
-RANGE = "low"
+RANGE = "high"
 
 # -----------------------------
 # User-defined operating point
@@ -36,6 +36,7 @@ else:
     G0 = ctl.TransferFunction([ 0,15.0224,   20.4896],
                               [1.0000,    1.3026,    0.1813])
 
+
 # Ensure discrete plant at Ts
 Gd = G0 if G0.dt not in (None, 0) else ctl.c2d(G0, Ts, method='tustin')
 
@@ -56,13 +57,19 @@ kb_aw = 1.0
 
 # PID params
 if RANGE == "low":
-    kp, ki, kd, N_d =  0.43127789,  0.43676547,  0.0,     14.64609183
+    kp, ki, kd, N_d =  0.43127789,  0.43676547,  0.5,     14.64609183
 elif RANGE == "mid":
-    kp, ki, kd, N_d =  0.11675119, 0.0514106, 0.0, 14.90530836
+    kp, ki, kd, N_d =  0.11675119, 0.0514106, 0.5, 14.90530836
 else:
-    kp, ki, kd, N_d =  0.13408096 , 0.07281374 , 0.0, 12.16810135
+    kp, ki, kd, N_d =  0.13408096 , 0.07281374 , 0.5, 12.16810135
 
-pid = PID(kp, ki, kd, N_d, Ts, u_min, u_max, kb_aw, der_on_meas=True)
+# Discretization variants to compare. (User label, PID discretization_method)
+pid_methods = [
+    ("tustin", "tustin"),
+    ("backeuler", "backeuler"),
+    ("fordwardeuler", "forwardeuler"),
+]
+
 
 # Time and reference
 time = np.arange(N_steps + 1) * Ts
@@ -84,68 +91,69 @@ r[time >= 200.0] = bot
 r[time >= 250.0] = top
 r[time >= 300.0] = bot
 
-# Absolute throttle profile (as before)
-u_raw = np.full_like(time, 0.7)
-u_raw[time >= 30]  = 0.75
-u_raw[time >= 80]  = 0.7
-u_raw[time >= 130] = 0.63
-u_raw[time >= 180] = 0.75
-u_raw[time >= 230] = 0.63
-u_raw[time >= 280] = 0.7
-u_raw[time >= 350] = 0
+meas_noise_std = 0.0005
 
-# -----------------------------
-# Incremental I/O construction
-# -----------------------------
-du = u_raw - u0            # model input is Δu
-dv = np.zeros_like(time)   # model output is Δv (what we simulate)
+results = {}
 
-# Optional: if you want an incremental reference for a controller
-# dr = r - v0
+for label, discretization_method in pid_methods:
+    pid = PID(
+        kp,
+        ki,
+        kd,
+        N_d,
+        Ts,
+        u_min,
+        u_max,
+        kb_aw,
+        der_on_meas=True,
+        derivative_disc_method=discretization_method,
+        integral_disc_method=discretization_method
+    )
 
-u = np.zeros_like(time)    # will store absolute throttle actually applied (for plotting)
-y = np.zeros_like(time)    # will store absolute speed reconstructed (for plotting)
+    # Incremental I/O construction
+    dv = np.zeros_like(time)   # model output is Δv
+    u = np.zeros_like(time)    # absolute throttle actually applied
+    y = np.zeros_like(time)    # absolute speed reconstructed
 
-meas_noise_std = 0.05
+    # Initial plant state (incremental state)
+    x = np.zeros(Ad.shape[0])
 
-# Initial plant state (incremental state)
-x = np.zeros(Ad.shape[0])
+    for k in range(N_steps):
+        y[k] = v0 + dv[k]
+        y_meas = y[k] + np.random.normal(0.0, meas_noise_std)
 
-for k in range(N_steps):
-    # Current absolute output is reconstructed from dv
-    y[k] = v0 + dv[k]
+        # PID operates on absolute (r, y_meas) and outputs absolute throttle.
+        u_cmd = pid.step(r[k], y_meas)
+        u[k] = np.clip(u_cmd, u_min, u_max)
+        du_k = u[k] - u0
 
-    # Measurement noise on absolute measurement (if you use PID)
-    y_meas = y[k] + np.random.normal(0.0, meas_noise_std)
+        # Incremental plant update (Δu -> Δv)
+        x = Ad @ x + Bd * du_k
+        dv[k + 1] = (Cd @ x + Dd * du_k).item()
 
-    # If using PID, it should act on absolute (r, y_meas) but drive incremental plant:
-    du_cmd = pid.step(r[k], y_meas) - u0
-    du[k] = du_cmd
-    u[k] = np.clip(u0 + du[k], u_min, u_max)
-    
-    du_k = u[k] - u0
+    # Fill last samples for plotting
+    u[-1] = u[-2]
+    y[-1] = v0 + dv[-1]
+    results[label] = {"u": u, "y": y}
 
-    # Incremental plant update (Δu -> Δv)
-    x = Ad @ x + Bd * du_k
-    dv[k + 1] = (Cd @ x + Dd * du_k).item()
 
-# Fill last samples for plotting
-u[-1] = u[-2]
-y[-1] = v0 + dv[-1]
+fig, (ax_y, ax_u) = plt.subplots(2, 1, figsize=(14, 8), sharex=True)
 
-plt.figure(figsize=(10, 6))
-plt.subplot(2, 1, 1)
-plt.plot(time, r, '--', label='r (abs)')
-plt.plot(time, y, label='y (abs reconstructed)')
-plt.grid(True)
-plt.legend()
-plt.ylabel('Speed [m/s]')
+ax_y.plot(time, r, "k--", linewidth=1.2, label="r")
+for label, _ in pid_methods:
+    ax_y.plot(time, results[label]["y"], label=f"y ({label})")
+ax_y.grid(True)
+ax_y.set_ylabel("Speed [m/s]")
+ax_y.legend(loc="best")
 
-plt.subplot(2, 1, 2)
-plt.plot(time, u, label='u (abs throttle)')
-plt.grid(True)
-plt.legend()
-plt.xlabel('t [s]')
+for label, _ in pid_methods:
+    ax_u.plot(time, results[label]["u"], label=f"u ({label})")
+ax_u.axhline(u_min, color="k", linewidth=0.8, alpha=0.3)
+ax_u.axhline(u_max, color="k", linewidth=0.8, alpha=0.3)
+ax_u.grid(True)
+ax_u.set_ylabel("Throttle [-]")
+ax_u.set_xlabel("t [s]")
+ax_u.legend(loc="best")
 
 plt.tight_layout()
 plt.show()
