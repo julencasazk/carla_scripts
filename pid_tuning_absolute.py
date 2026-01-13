@@ -17,6 +17,9 @@ Metrics:
 IMPORTANT:
 - Provide correct operating points (u0, v0) for the speed range.
 - Provide Gd as the INCREMENTAL plant (Δu -> Δv), discrete at Ts.
+- Use plot_csv.py to quickly view the average, max and min values
+    of the speed range test, and properly stablish u0 and ref_pv
+    values
 """
 
 import argparse
@@ -207,7 +210,7 @@ def sim_closed_loop_pid(kp, ki, kd,
 
     Plant update uses du = u_abs - u0.
     """
-    pid = PID(kp, ki, kd, N, Ts, u_min, u_max, kb_aw, der_on_meas=True)
+    pid = PID(kp, ki, kd, N, Ts, u_min, u_max, kb_aw, der_on_meas=True, integral_disc_method="backeuler", derivative_disc_method="tustin")
 
     n_steps = int(t_final / Ts)
     t = np.arange(n_steps + 1) * Ts
@@ -530,11 +533,11 @@ def pid_cost_normalized(x,
 
     if weights is None:
         weights = {
-            "SSE":      5.0,
+            "SSE":      3.0,
             "OS":       3.0,
-            "TsTr":     2.0,
+            "TsTr":     1.0,
             "RVG":      2.0,
-            "ODJ":      1.2,
+            "ODJ":      2.0,
             "u_rms":    0.5,
             "du_rms":   2.0,
             "sat_ratio":0.5,
@@ -592,10 +595,10 @@ def main(args):
     # v0 = base_ref (speed operating point)
     # u0 = throttle operating point
     # ------------------------------------------------------------------
-    # Example for high range (define these based on your identified range):
-    ref_pv = ((11.11111 - 0.0) / 2.0) + 0.0  # v0
-    setpoint = 11.11111                                 # absolute setpoint
-    u0 = 0.35                                          # throttle operating point (ABS)
+
+    ref_pv = 6.1416430166666665
+    setpoint = 10.0 
+    u0 = 0.266666666666
 
     # ------------------------------------------------------------------
     # IMPORTANT: Gd must represent the INCREMENTAL plant Δv/Δu (Remove Means)
@@ -605,10 +608,22 @@ def main(args):
     # Incremental Plant
     #G0 = ctl.TransferFunction([0,   16.0307,  241.7231], # High speeds
     #                          [1.0000, 13.8711, 2.1097])
+
+    #G0 = ctl.TransferFunction([0,45.5849,23.7842,0.5994],      # New values, 3p2z continuous
+    #                          [1.0000,2.4052,0.2322,0.0144])
+
     #G0 = ctl.TransferFunction([0, 12.3082, 67.2242], # Mid Speeds
     #                         [1.0000, 5.2957, 1.0404])
-    G0 = ctl.TransferFunction([0,    8.5777,   54.0770], # Low speeds
-                              [1.0000,    7.0533,    2.1718])
+
+    #G0 = ctl.TransferFunction([0,56.3703, 155.5811,2.6035], # New values, 3p2z continuous
+    #                         [1.0000,    15.5755,    2.6333,    0.0852])
+
+    #G0 = ctl.TransferFunction([0,    8.5777,   54.0770], # Low speeds
+    #                          [1.0000,    7.0533,    2.1718])
+
+    G0 = ctl.TransferFunction([0, 7.8409], # Low speeds # New values 1p continuous
+                              [ 1.0000, 0.3321])
+
     Gd = ctl.c2d(G0, Ts, method='tustin')
 
     # PID search bounds: [kp, ki, kd, N]
