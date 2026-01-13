@@ -434,6 +434,8 @@ def compute_metric_scales(Gd,
     du_vals = []
     sat_vals = []
 
+    print(f"Compute scaling factors with {num_samples} random samples...")
+
     for i in range(num_samples):
         # Sample full vector [kp, ki, kd, N]
         sample = np.array(
