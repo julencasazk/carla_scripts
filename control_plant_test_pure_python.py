@@ -4,7 +4,8 @@ import control as ctl
 from PID import PID
 
 
-RANGE = "high"
+RANGE = "low"
+
 
 # -----------------------------
 # User-defined operating point
@@ -27,14 +28,25 @@ N_steps = int(T_sim / Ts)
 
 # Plants for each range
 if RANGE == "low":
-    G0 = ctl.TransferFunction([0, 8.5777, 54.0770], # Low speeds
-                              [1.0000, 7.0533, 2.1718])
+    #G0 = ctl.TransferFunction([0, 8.5777, 54.0770], # Low speeds # Old values
+    #                          [1.0000, 7.0533, 2.1718])
+
+    G0 = ctl.TransferFunction([0, 7.8409], # Low speeds # New values 1p continuous
+                              [ 1.0000, 0.3321])
 elif RANGE == "mid":
-    G0 = ctl.TransferFunction([0,   12.3082,   67.2242],
-                              [1.0000,    5.2957,    1.0404]) 
+    #G0 = ctl.TransferFunction([0,   12.3082,   67.2242],        # Old values
+    #                          [1.0000,    5.2957,    1.0404]) 
+
+    G0 = ctl.TransferFunction([0,56.3703, 155.5811,2.6035], # New values, 3p2z continuous
+                             [1.0000,    15.5755,    2.6333,    0.0852])
 else:
-    G0 = ctl.TransferFunction([ 0,15.0224,   20.4896],
-                              [1.0000,    1.3026,    0.1813])
+
+    #G0 = ctl.TransferFunction([ 0,15.0224,   20.4896],         # Old values    
+    #                          [1.0000,    1.3026,    0.1813])
+    G0 = ctl.TransferFunction([0,45.5849,23.7842,0.5994],      # New values, 3p2z continuous
+                              [1.0000,2.4052,0.2322,0.0144])
+    #G0 = ctl.TransferFunction([ 0, 16.0307, 241.7231],         # New values 2p1z discrete, seems to be the same as old one
+    #                          [1.0000, 13.8711, 2.1097])
 
 
 # Ensure discrete plant at Ts
@@ -57,11 +69,17 @@ kb_aw = 1.0
 
 # PID params
 if RANGE == "low":
-    kp, ki, kd, N_d =  0.43127789,  0.43676547,  0.5,     14.64609183
+
+    #kp, ki, kd, N_d =  0.43127789,0.43676547,0.5,14.64609183
+    kp, ki, kd, N_d = 0.1089194,0.04906409, 0.0, 7.71822214 
 elif RANGE == "mid":
-    kp, ki, kd, N_d =  0.11675119, 0.0514106, 0.5, 14.90530836
+    #kp, ki, kd, N_d =  0.11675119, 0.0514106, 0.5, 14.90530836
+    kp, ki, kd, N_d =  0.11494122, 0.0489494,  0.0, 5.0        
+    
 else:
-    kp, ki, kd, N_d =  0.13408096 , 0.07281374 , 0.5, 12.16810135
+    kp, ki, kd, N_d =  0.13408096 , 0.07281374 , 0.0, 12.16810135 # Original from way back
+    #kp, ki, kd, N_d =  0.28508729, 0.45692171, 0.0,15.0 # Aggresive with absolute values again
+    #kp, ki, kd, N_d =  0.19211881, 0.18328656, 0.0, 9.29094921 # Aggresive with absolute values again
 
 # Discretization variants to compare. (User label, PID discretization_method)
 pid_methods = [
