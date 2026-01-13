@@ -6,14 +6,19 @@ Decision variables:
     x = [kp, ki, kd, N]
 
 Metrics:
-    J1: SSE   (steady-state error)
-    J2: OS    (overshoot, %)
-    J3: TsTr  (Ts - Tr, settling minus rise time)
-    J4: RVG   (robustness to gain variation)
-    J5: ODJ   (output disturbance rejection)
-    J6: u_rms (RMS control effort)
-    J7: du_rms (RMS control rate)
-    J8: sat_ratio (fraction of time at upper saturation)
+    J1: SSE        (steady-state error, absolute in Δ-units)
+    J2: OS         (overshoot, %, sign-robust via normalized response y/ref)
+    J3: TsTr       (Ts - Tr, settling minus rise time)
+    J4: RVG        (robustness to gain variation)
+    J5: ODJ        (output disturbance rejection)
+    J6: u_rms      (RMS control effort)
+    J7: du_rms     (RMS control rate)
+    J8: sat_ratio  (fraction of time at upper saturation)
+
+
+Note:
+  - Measurement noise is set to 0 by default to keep objective deterministic.
+    
 """
 
 import argparse
@@ -24,11 +29,18 @@ import matplotlib.pyplot as plt
 import control as ctl
 import multiprocessing as mp
 
-from PID import PID  # your existing PID implementation
+from PID import PID  
 
 
 JSON_FILE = "metric_scales_n.json"
 FIXED_KAW = 1.0  # anti-windup gain is fixed, not tuned
+
+# Determinism: keep noise off during tuning/scales unless explicitly enabled
+MEAS_NOISE_STD = 0.0
+
+# Aggressive step size in speed (m/s) relative to operating point v0.
+# This will be capped to stay within v_range_max below.
+STEP_DV = 3.0
 
 
 # ---------------------------------------------------------------------------
@@ -91,9 +103,7 @@ def pso(objective,
 
     def eval_particles(particles_batch):
         if pool is None:
-            # single-process
             return [objective(x, *objective_args) for x in particles_batch]
-        # multi-process: pack each particle with objective + args
         jobs = [(x, objective, objective_args) for x in particles_batch]
         return pool.map(_pso_worker, jobs)
 
@@ -131,7 +141,6 @@ def pso(objective,
             try:
                 J_values = np.zeros(num_particles, dtype=float)
 
-                # update velocities and positions
                 for i in range(num_particles):
                     r1 = np.random.rand(dim)
                     r2 = np.random.rand(dim)
@@ -144,7 +153,6 @@ def pso(objective,
                     particles[i] += velocities[i]
                     particles[i] = np.clip(particles[i], bounds_min, bounds_max)
 
-                # evaluate all particles
                 results = eval_particles(particles)
 
                 for i in range(num_particles):
@@ -171,7 +179,7 @@ def pso(objective,
                         "u_rms": float(metrics["u_rms"]),
                         "du_rms": float(metrics["du_rms"]),
                         "sat_ratio": float(metrics["sat_ratio"]),
-                        "best_x": gbest_position.tolist(), 
+                        "best_x": gbest_position.tolist(),
                         "best_cost": float(gbest_value)
                     })
 
@@ -219,10 +227,15 @@ def sim_closed_loop_pid(kp, ki, kd,
                         t_final=5.0,
                         ref=1.0,
                         disturb_time=None,
-                        disturb_value=0.0):
+                        disturb_value=0.0,
+                        meas_noise_std=MEAS_NOISE_STD):
     """
     Closed-loop simulation with discrete PID and discrete plant Gd
     using state-space stepping.
+
+    IMPORTANT:
+      - This simulation is in incremental coordinates (Δy, Δu) if Gd is identified
+        on mean-removed data. Then ref is Δy_ref.
     """
     pid = PID(kp, ki, kd, N, Ts, u_min, u_max, kb_aw, der_on_meas=True)
 
@@ -240,11 +253,6 @@ def sim_closed_loop_pid(kp, ki, kd,
     y = np.zeros_like(t, dtype=float)
     u = np.zeros_like(t, dtype=float)
 
-    # Some gaussian noise to measurement so that the resulting
-    # pid is more robust to small variations.
-    # Might penalize derivative component heavily, dunno lol
-    meas_noise_std = 0.05
-
     for k in range(n_steps):
         y_meas = y[k]
         if disturb_time is not None and t[k] >= disturb_time:
@@ -256,38 +264,72 @@ def sim_closed_loop_pid(kp, ki, kd,
         u[k] = pid.step(r[k], y_meas)
 
         x = Ad @ x + Bd * u[k]
-        y[k+1] = (Cd @ x + Dd * u[k]).item()
+        y[k + 1] = (Cd @ x + Dd * u[k]).item()
 
     return t, y, u
 
 
 def step_metrics(t, y, ref=1.0, tol=0.02):
-    """Compute SSE, overshoot (OS%), rise time Tr, settling time Ts_."""
+    """
+    Robust metrics for positive/negative steps, without constant OS injection.
+
+    Returns: SSE, OS(%), Tr, Ts_
+      - SSE = |ref - y_final|
+      - OS computed in normalized space s=y/ref (sign-robust). Always computed.
+      - Tr: time to go from 10% to 90% of target in normalized space.
+            If never reaches 90% -> Tr = t_final (flag of failure).
+      - Ts_: settling time into |y-ref| <= tol*|ref| band.
+            If never settles -> Ts_ = t_final (flag of failure).
+    """
     y = np.asarray(y, dtype=float)
     t = np.asarray(t, dtype=float)
+    t_final = float(t[-1])
+
+    # Regulation case (ref ~ 0): treat separately
+    if abs(ref) < 1e-9:
+        SSE = abs(y[-1])
+        band = tol  # absolute band around 0
+        outside = np.abs(y) > band
+        if np.any(outside):
+            last_out = int(np.where(outside)[0][-1])
+            Ts_ = float(t[last_out + 1]) if (last_out + 1) < len(t) else t_final
+        else:
+            Ts_ = 0.0
+        Tr = t_final  # undefined
+        # OS% not meaningful; keep a bounded indicator
+        OS = 0.0
+        return float(SSE), float(OS), float(Tr), float(Ts_)
+
+    # Normalize by ref to make sign-robust
+    s = y / ref
 
     SSE = abs(ref - y[-1])
-    OS = max(0.0, (np.max(y) - ref) / max(ref, 1e-6) * 100.0)
 
-    y10 = 0.1 * ref
-    y90 = 0.9 * ref
-    try:
-        idx_10 = np.where(y > y10)[0][0]
-        idx_90 = np.where(y > y90)[0][0]
-        Tr = t[idx_90] - t[idx_10]
-    except IndexError:
-        Tr = t[-1]
-        OS += 100.0
+    # Overshoot always defined from peak of normalized response
+    OS = max(0.0, (np.max(s) - 1.0) * 100.0)
 
-    lower = ref * (1 - tol)
-    upper = ref * (1 + tol)
-    Ts_ = t[-1]
-    for i in range(len(t) - 1, -1, -1):
-        if y[i] < lower or y[i] > upper:
-            Ts_ = t[i + 1] if (i + 1) < len(t) else t[-1]
-            break
+    # Rise time: need reach 10% AND 90% in normalized space
+    reached_10 = np.where(s >= 0.1)[0]
+    reached_90 = np.where(s >= 0.9)[0]
 
-    return SSE, OS, Tr, Ts_
+    if reached_10.size > 0 and reached_90.size > 0:
+        idx_10 = int(reached_10[0])
+        idx_90 = int(reached_90[0])
+        Tr = float(t[idx_90] - t[idx_10])
+    else:
+        # Did not reach 90% (or even 10%): mark as failure via Tr=t_final
+        Tr = t_final
+
+    # Settling time in absolute band around ref
+    band = tol * abs(ref)
+    outside = np.abs(y - ref) > band
+    if np.any(outside):
+        last_out = int(np.where(outside)[0][-1])
+        Ts_ = float(t[last_out + 1]) if (last_out + 1) < len(t) else t_final
+    else:
+        Ts_ = 0.0
+
+    return float(SSE), float(OS), float(Tr), float(Ts_)
 
 
 # ---------------------------------------------------------------------------
@@ -316,7 +358,8 @@ def pid_metrics_raw(x,
         u_min, u_max, kb_aw,
         t_final, ref,
         disturb_time=None,
-        disturb_value=0.0
+        disturb_value=0.0,
+        meas_noise_std=MEAS_NOISE_STD
     )
 
     SSE_nom, OS_nom, Tr_nom, Ts__nom = step_metrics(t_nom, y_nom, ref)
@@ -331,7 +374,8 @@ def pid_metrics_raw(x,
         u_min, u_max, kb_aw,
         t_final, ref,
         disturb_time=None,
-        disturb_value=0.0
+        disturb_value=0.0,
+        meas_noise_std=MEAS_NOISE_STD
     )
     SSE_low, OS_low, Tr_low, Ts__low = step_metrics(t_low, y_low, ref)
 
@@ -343,7 +387,8 @@ def pid_metrics_raw(x,
         u_min, u_max, kb_aw,
         t_final, ref,
         disturb_time=None,
-        disturb_value=0.0
+        disturb_value=0.0,
+        meas_noise_std=MEAS_NOISE_STD
     )
     SSE_high, OS_high, Tr_high, Ts__high = step_metrics(t_high, y_high, ref)
 
@@ -367,20 +412,21 @@ def pid_metrics_raw(x,
         u_min, u_max, kb_aw,
         t_final, ref,
         disturb_time=disturb_time,
-        disturb_value=disturb_value
+        disturb_value=disturb_value,
+        meas_noise_std=MEAS_NOISE_STD
     )
 
     mask = t_dist >= disturb_time
     if np.any(mask):
         e_dist = ref - y_dist[mask]
-        ODJ = float(np.mean(e_dist**2))
+        ODJ = float(np.mean(e_dist ** 2))
     else:
         ODJ = 0.0
 
     # effort metrics
-    u_rms = float(np.sqrt(np.mean(u_nom**2)))
+    u_rms = float(np.sqrt(np.mean(u_nom ** 2)))
     du = np.diff(u_nom)
-    du_rms = float(np.sqrt(np.mean(du**2))) if len(du) > 0 else 0.0
+    du_rms = float(np.sqrt(np.mean(du ** 2))) if len(du) > 0 else 0.0
     sat_ratio = float(np.mean(u_nom >= (u_max - 1e-3)))
 
     metrics = {
@@ -425,23 +471,14 @@ def compute_metric_scales(Gd,
     """Randomly sample PID params in bounds, compute metrics, derive median+IQR scales."""
     rng = np.random.default_rng(seed)
 
-    SSE_vals = []
-    OS_vals = []
-    TsTr_vals = []
-    RVG_vals = []
-    ODJ_vals = []
-    u_vals = []
-    du_vals = []
-    sat_vals = []
+    SSE_vals, OS_vals, TsTr_vals = [], [], []
+    RVG_vals, ODJ_vals = [], []
+    u_vals, du_vals, sat_vals = [], [], []
 
     print(f"Compute scaling factors with {num_samples} random samples...")
 
     for i in range(num_samples):
-        # Sample full vector [kp, ki, kd, N]
-        sample = np.array(
-            [rng.uniform(*b) for b in bounds],
-            dtype=float
-        )
+        sample = np.array([rng.uniform(*b) for b in bounds], dtype=float)
 
         metrics = pid_metrics_raw(
             sample, Gd,
@@ -462,24 +499,15 @@ def compute_metric_scales(Gd,
         if (i + 1) % 50 == 0:
             print(f"Scale sample {i+1}/{num_samples}")
 
-    SSE_vals = np.array(SSE_vals)
-    OS_vals = np.array(OS_vals)
-    TsTr_vals = np.array(TsTr_vals)
-    RVG_vals = np.array(RVG_vals)
-    ODJ_vals = np.array(ODJ_vals)
-    u_vals = np.array(u_vals)
-    du_vals = np.array(du_vals)
-    sat_vals = np.array(sat_vals)
-
     scales = {
-        "SSE": robust_scale(SSE_vals),
-        "OS": robust_scale(OS_vals),
-        "TsTr": robust_scale(TsTr_vals),
-        "RVG": robust_scale(RVG_vals),
-        "ODJ": robust_scale(ODJ_vals),
-        "u_rms": robust_scale(u_vals),
-        "du_rms": robust_scale(du_vals),
-        "sat_ratio": robust_scale(sat_vals),
+        "SSE": robust_scale(np.array(SSE_vals)),
+        "OS": robust_scale(np.array(OS_vals)),
+        "TsTr": robust_scale(np.array(TsTr_vals)),
+        "RVG": robust_scale(np.array(RVG_vals)),
+        "ODJ": robust_scale(np.array(ODJ_vals)),
+        "u_rms": robust_scale(np.array(u_vals)),
+        "du_rms": robust_scale(np.array(du_vals)),
+        "sat_ratio": robust_scale(np.array(sat_vals)),
     }
 
     print("Computed metric scales (median+IQR):")
@@ -543,14 +571,14 @@ def pid_cost_normalized(x,
 
     if weights is None:
         weights = {
-            "SSE":    5.0,
-            "OS":     3.0,
-            "TsTr":   0.0,
-            "RVG":    0.0,
-            "ODJ":    0.0,
-            "u_rms":  0.0,
-            "du_rms": 4.0,
-            "sat_ratio": 0.0,
+            "SSE":      5.0,
+            "OS":       3.0,
+            "TsTr":     2.0,   # was 0.0: give some dynamics incentive
+            "RVG":      0.5,
+            "ODJ":      1.0,
+            "u_rms":    1.0,
+            "du_rms":   4.0,
+            "sat_ratio": 1.0,  # small push away from living at saturation
         }
 
     J = 0.0
@@ -576,10 +604,7 @@ def objective_pid_global(x,
                          setpoint,
                          scales,
                          weights=None):
-    """
-    Top-level objective for multiprocessing.
-    x = [kp, ki, kd, N]
-    """
+    """Top-level objective for multiprocessing."""
     return pid_cost_normalized(
         x, Gd,
         Ts=Ts,
@@ -599,44 +624,43 @@ def main(args):
 
     # General settings
     Ts = 0.01
-    # Now u are delta_u, so u_min and u_max are just the maxixmum and minimum offset from
-    # from the u that takes the vehicle to the center of the range.
-    u_ref = 0.68
-    u_range_max = 0.73
-    u_range_min = 0.62
-    
-    u_min = u_range_min - u_ref
-    u_max = u_range_max - u_ref
     T_sim = 80.0
 
+    # ---- Operating point from dataset (mean values) ----
+    v0 = 29.1063989
+    u0 = 0.6933333333333334
+
+    # ---- Observed test extremes ----
+    v_test_min = 22.681
+    v_test_max = 35.6147
+    u_test_min = 0.63
+    u_test_max = 0.75
+
+    # ---- Define setpoint as Δv_ref (aggressive step, capped within range) ----
+    
+    v_target = min(v0 + STEP_DV, v_test_max)
+    setpoint = v_target - v0  # Δv_ref in m/s
+
+    # ---- Actuator saturation in Δu around u0 ----
+    u_min = u_test_min - u0
+    u_max = u_test_max - u0
+
+    print("Operating point / limits used:")
+    print(f"  v0 = {v0:.6f} m/s, u0 = {u0:.6f}")
+    print(f"  v_target = {v_target:.6f} -> Δv_ref(setpoint) = {setpoint:.6f} m/s")
+    print(f"  Δu limits: u_min = {u_min:.6f}, u_max = {u_max:.6f}")
+
+    # Plant
     s = ctl.TransferFunction.s
-    '''
-    # Plant fitted with maximum speed 
-    Td = 0.15
-    G0 = 12.68 / (s**2 + 1.076*s + 0.2744)
-    num_delay, den_delay = ctl.pade(Td, 1)
-    H_delay = ctl.tf(num_delay, den_delay)
-    Gc = G0 * H_delay
-    Gd = ctl.c2d(Gc, Ts, method="tustin")
-    '''
-   
-    # Plants for each range, only leave one uncommented, obviously
-    #G0 = 7.841 / (s + 0.3321) # Low speed range
-    #G0 = (56.37*s**2 + 155.6*s + 2.604) / (s**3 + 15.58*s**2 + 2.633*s + 0.08517) # middle range
-    G0 = (45.58*s**2 + 23.78*s + 2.604) / (s**3 + 2.405*s**2 + 0.2322*s + 0.01443) # High speed range
+    G0 = (45.58*s**2 + 23.78*s + 2.604) / (s**3 + 2.405*s**2 + 0.2322*s + 0.01443)  # High speed range
     Gd = ctl.c2d(G0, Ts, method='tustin')
-    
-    range_max = 33.33333
-    range_min = 22.22222
-    
-    setpoint = (range_max - range_min) / 2.0
 
     # PID search bounds: [kp, ki, kd, N]
     bounds = [
-        (0.0, 2.0),   # Kp
-        (0.0, 1.0),   # Ki
-        (0.0, 1.5),  # Kd
-        (5.0, 15.0),  # N
+        (0.0, 2.0),    # Kp
+        (0.0, 1.0),    # Ki
+        (0.0, 1.5),    # Kd
+        (5.0, 15.0),   # N
     ]
 
     # Optional: offline scales computation mode
@@ -686,7 +710,7 @@ def main(args):
     plt.title("Best cost history")
     plt.grid(True)
 
-    # --- New: simulate and plot step response for best controller ---
+    # simulate and plot step response for best controller (Δ-coordinates)
     kp, ki, kd, N = best_x
     kb_aw = FIXED_KAW
 
@@ -697,31 +721,32 @@ def main(args):
         u_min, u_max, kb_aw,
         t_final=T_sim, ref=setpoint,
         disturb_time=None,
-        disturb_value=0.0
+        disturb_value=0.0,
+        meas_noise_std=MEAS_NOISE_STD
     )
 
-    # Output vs reference
+    # Output vs reference (Δy)
     plt.figure()
-    plt.plot(t_best, y_best, label="Output y(t)")
-    plt.plot(t_best, np.full_like(t_best, setpoint), "k--", label="Reference")
+    plt.plot(t_best, y_best, label="Output Δv(t)")
+    plt.plot(t_best, np.full_like(t_best, setpoint), "k--", label="Reference Δv_ref")
     plt.xlabel("time [s]")
-    plt.ylabel("speed")
-    plt.title("Step response of best PID")
+    plt.ylabel("Δspeed [m/s]")
+    plt.title("Step response of best PID (incremental model)")
     plt.grid(True)
     plt.legend()
 
-    # Control signal
+    # Control signal (Δu)
     plt.figure()
-    plt.plot(t_best, u_best, label="u(t)")
+    plt.plot(t_best, u_best, label="Δu(t)")
+    plt.axhline(u_min, linestyle="--", linewidth=1, label="Δu min")
+    plt.axhline(u_max, linestyle="--", linewidth=1, label="Δu max")
     plt.xlabel("time [s]")
-    plt.ylabel("control signal u")
-    plt.title("Control signal of best PID")
+    plt.ylabel("Δthrottle")
+    plt.title("Control signal of best PID (Δu)")
     plt.grid(True)
     plt.legend()
 
     plt.show()
-
-    
 
 
 if __name__ == "__main__":
@@ -744,7 +769,6 @@ if __name__ == "__main__":
         default=0,
         help="Numpy random number generator seed (0 -> random)"
     )
-
     parser.add_argument(
         "--compute-scales",
         action="store_true",
@@ -756,7 +780,6 @@ if __name__ == "__main__":
         default=300,
         help="Number of random PIDs to sample when computing scales"
     )
-
     parser.add_argument(
         "--workers",
         type=int,
