@@ -1018,7 +1018,7 @@ def main():
 
     # PID scheduling gains (match following_python_test.py / Platooning.py)
     kb_aw = 1.0
-    u_min, u_max = -1.0, 1.0
+    u_min, u_max = -1.0, 1.0 # TODO Bound to 0.0 to 1.0 and let brake arbiter deal with braking
 
     nodes = [bridge]
     for i, name in enumerate(bridge.ros_names):
@@ -1026,9 +1026,15 @@ def main():
             continue
         platoon_index = i
 
-        slow_pid = PID(0.43127789, 0.43676547, 0.0, 15.0, Ts, u_min, u_max, kb_aw, der_on_meas=True)
-        mid_pid = PID(0.11675119, 0.085938,   0.0, 14.90530836, Ts, u_min, u_max, kb_aw, der_on_meas=True)
-        fast_pid = PID(0.13408096, 0.07281374, 0.0, 12.16810135, Ts, u_min, u_max, kb_aw, der_on_meas=True)
+        # Outdated values
+        #slow_pid = PID(0.43127789, 0.43676547, 0.0, 15.0, Ts, u_min, u_max, kb_aw, der_on_meas=True)
+        #mid_pid = PID(0.11675119, 0.085938,   0.0, 14.90530836, Ts, u_min, u_max, kb_aw, der_on_meas=True)
+        #fast_pid = PID(0.13408096, 0.07281374, 0.0, 12.16810135, Ts, u_min, u_max, kb_aw, der_on_meas=True)
+
+        # New values, must check in sim
+        slow_pid = PID(0.1089194,0.04906409, 0.0, 7.71822214, Ts, u_min, u_max, kb_aw, der_on_meas=True)
+        mid_pid = PID(0.11494122, 0.0489494,  0.0, 5.0 , Ts, u_min, u_max, kb_aw, der_on_meas=True)
+        fast_pid = PID( 0.19021246, 0.15704399, 0.0, 12.70886655, Ts, u_min, u_max, kb_aw, der_on_meas=True)
 
         # Use the same spacing parameters as stored in the bridge so that the
         # desired distance used by controllers matches what is logged.
