@@ -1,6 +1,6 @@
 
 class PID:
-    def __init__(self, kp, ki, kd, N, Ts, u_min, u_max, kb_aw, der_on_meas=False, prop_on_meas=False):
+    def __init__(self, kp, ki, kd, N, Ts, u_min, u_max, kb_aw, der_on_meas=False, prop_on_meas=False, derivative_disc_method="tustin", integral_disc_method="backeuler"):
         self.kp = kp
         self.ki = ki
         self.kd = kd
@@ -11,13 +11,14 @@ class PID:
         self.kb_aw = kb_aw
         self.der_on_meas = der_on_meas
         self.prop_on_meas = prop_on_meas
+        self.derivative_disc_method = derivative_disc_method
+        self.integral_disc_method = integral_disc_method
 
         self.i_state = 0.0
         self.e_prev = 0.0
         self.d_prev = 0.0
         self.w_prev = 0.0
     
-
         self._update_derivative_coeffs()
 
     def _update_derivative_coeffs(self):
@@ -28,8 +29,15 @@ class PID:
             self.k_u = 0.0
             self.k_w = 0.0
         else:
-            self.k_u = -((N * Ts - 2.0) / (N * Ts + 2.0))     # Tustin
-            self.k_w = (2.0 * Kd) / (N * Ts + 2.0)
+            if self.derivative_disc_method == "tustin":
+                self.k_u = -((N * Ts - 2.0) / (N * Ts + 2.0))     # Tustin
+                self.k_w = (2.0 * N * Kd) / (N * Ts + 2.0)
+            elif self.derivative_disc_method == "backeuler":
+                self.k_u = 1.0 / (1.0 + (N * Ts))                 # backwards euler
+                self.k_w = ((Kd * N)/(1.0+(N * Ts)))
+            else:
+                self.k_u = -((N * Ts) - 1)
+                self.k_w = Kd * N
 
     def step(self, setpoint, measurement):
         e = setpoint - measurement
@@ -45,7 +53,13 @@ class PID:
         self.d_prev = u_d
         self.w_prev = w_d
 
-        dI_base = self.ki * self.ts * e  # backward Euler
+        if self.integral_disc_method == "tustin":
+            dI_base = 0.5 * self.ki * self.ts * (e + self.e_prev)
+        elif self.integral_disc_method == "backeuler":
+            dI_base = self.ki * self.ts * e
+        else:
+            dI_base = self.ki * self.ts * self.e_prev
+
         u_i = self.i_state + dI_base
 
         u_unsat = u_p + u_i + u_d
