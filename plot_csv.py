@@ -6,6 +6,7 @@ import sys
 from pathlib import Path
 
 import pandas as pd
+import numpy as np
 import matplotlib.pyplot as plt
 
 
@@ -92,6 +93,9 @@ def main():
         axes = [axes]
 
     for i, (col, ax) in enumerate(zip(args.plot, axes)):
+
+        print(f"Column {col}, avg: {np.average(df[col])}, max: {np.max(df[col])}, min: {np.min(df[col])}")
+        
         color = colors[i % len(colors)]
         ax.plot(x, df[col], color=color)
         ax.set_ylabel(col)
