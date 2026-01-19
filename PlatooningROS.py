@@ -45,7 +45,6 @@ class PlatoonMember(Node):
     ):
         """
         platoon_index: 0 for leader, 1..N-1 for followers.
-        For followers, a distance-based correction is applied to the speed setpoint.
         """
         super().__init__(name)
 
@@ -389,7 +388,7 @@ class PlatoonMember(Node):
         if dist_err >= 0.0:
             d_sp = self._K_dist * dist_err + self._K_vel * vel_diff
         else:
-            d_sp = 4.0 * self._K_dist * dist_err + self._K_vel * vel_diff
+            d_sp = 4.0 * (self._K_dist * dist_err + self._K_vel * vel_diff)
 
         eff_sp = min(base_sp + d_sp, 33.33)
         eff_sp = max(eff_sp, 0.0)

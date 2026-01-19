@@ -214,6 +214,13 @@ class FollowingRosTest(Node):
                 ),
                 rotation=base_spawn_point.rotation,
             )
+
+            if i == self.mcu_index:
+                vehicle_bp.set_attribute('color', '255,0,0')
+            else:
+                vehicle_bp.set_attribute('color', '0,0,0')
+                
+
             veh = world.spawn_actor(vehicle_bp, spawn_tf)
             veh.set_autopilot(False)
 
