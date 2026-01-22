@@ -360,16 +360,14 @@ class FollowingRosTest(Node):
 
         # Lead speed setpoints (global platoon reference, m/s)
         self.lead_speed_setpoints = [
-            30.0,
-            30.0,
-            30.0,
-            30.0,
-            30.0,
-            30.0,
-            30.0,
-            30.0,
-            30.0,
-            30.0,
+                5.0,
+                10.0,
+                0.0,
+                30.0,
+                22.0,
+                10.0,
+                0.0,
+
         ]
 
         self.lead_sp_idx = 0

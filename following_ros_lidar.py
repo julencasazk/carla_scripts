@@ -200,6 +200,19 @@ class FollowingRosTest(Node):
         
         self.alpha = 0.4
 
+        
+        self.lidar_sensors = []
+        self.lidar_queues = []
+
+        
+        def lidar_cb(data, queue):
+            pts = np.frombuffer(data.raw_data, dtype=np.float32)
+            pts = np.reshape(pts, (int(pts.shape[0] / 4), 4))[:, :3]
+            try:
+                queue.put_nowait(pts)
+            except queue.Full:
+                pass
+
         # Spawn platoon members
         for i in range(self.plen):
 
@@ -214,10 +227,32 @@ class FollowingRosTest(Node):
                 ),
                 rotation=base_spawn_point.rotation,
             )
+
+            if i == self.mcu_index:
+                vehicle_bp.set_attribute('color', '255,0,0')
+            else:
+                vehicle_bp.set_attribute('color', '0,0,0')
+                
+
             veh = world.spawn_actor(vehicle_bp, spawn_tf)
             veh.set_autopilot(False)
 
             self.get_logger().info(f"Spawned {veh.type_id} as {ros_name} at {spawn_tf}")
+
+
+            # LiDAR sensor
+            lidar_bp = bp_library.find("sensor.lidar.ray_cast")
+            lidar_tf = carla.Transform(carla.Location(x=0.0, y=0.0, z=1.0))
+
+            lidar =  world.spawn_actor(lidar_bp, lidar_tf, attach_to=veh)
+            self.get_logger().info(f"Spawned {lidar.type_id} attached to {ros_name} at {lidar_tf}")
+
+            self.lidar_sensors.append(lidar)
+            lidar_queue = queue.Queue(maxsize=1)
+
+            self.lidar_queues.append(lidar_queue)
+
+            lidar.listen(lambda data: lidar_cb(data, lidar_queue))
 
             self.ros_names.append(ros_name)
             self.vehicles.append(veh)
@@ -353,16 +388,14 @@ class FollowingRosTest(Node):
 
         # Lead speed setpoints (global platoon reference, m/s)
         self.lead_speed_setpoints = [
-            30.0,
-            30.0,
-            30.0,
-            30.0,
-            30.0,
-            30.0,
-            30.0,
-            30.0,
-            30.0,
-            30.0,
+                5.0,
+                10.0,
+                0.0,
+                30.0,
+                22.0,
+                10.0,
+                0.0,
+
         ]
 
         self.lead_sp_idx = 0
@@ -645,6 +678,8 @@ class FollowingRosTest(Node):
         for i, name in enumerate(self.ros_names):
             speed = speeds[i]
             self.speed_pubs[name].publish(Float32(data=float(speed)))
+
+            # TODO take lidar pointcloud and compute distance to front
 
             if i == 0:
                 dist_to_prev = 0.0
@@ -1018,7 +1053,7 @@ def main():
 
     # PID scheduling gains (match following_python_test.py / Platooning.py)
     kb_aw = 1.0
-    u_min, u_max = -1.0, 1.0
+    u_min, u_max = -1.0, 1.0 # TODO Bound to 0.0 to 1.0 and let brake arbiter deal with braking
 
     nodes = [bridge]
     for i, name in enumerate(bridge.ros_names):
@@ -1026,9 +1061,15 @@ def main():
             continue
         platoon_index = i
 
-        slow_pid = PID(0.43127789, 0.43676547, 0.0, 15.0, Ts, u_min, u_max, kb_aw, der_on_meas=True)
-        mid_pid = PID(0.11675119, 0.085938,   0.0, 14.90530836, Ts, u_min, u_max, kb_aw, der_on_meas=True)
-        fast_pid = PID(0.13408096, 0.07281374, 0.0, 12.16810135, Ts, u_min, u_max, kb_aw, der_on_meas=True)
+        # Outdated values
+        #slow_pid = PID(0.43127789, 0.43676547, 0.0, 15.0, Ts, u_min, u_max, kb_aw, der_on_meas=True)
+        #mid_pid = PID(0.11675119, 0.085938,   0.0, 14.90530836, Ts, u_min, u_max, kb_aw, der_on_meas=True)
+        #fast_pid = PID(0.13408096, 0.07281374, 0.0, 12.16810135, Ts, u_min, u_max, kb_aw, der_on_meas=True)
+
+        # New values, must check in sim
+        slow_pid = PID(0.1089194,0.04906409, 0.0, 7.71822214, Ts, u_min, u_max, kb_aw, der_on_meas=True)
+        mid_pid = PID(0.11494122, 0.0489494,  0.0, 5.0 , Ts, u_min, u_max, kb_aw, der_on_meas=True)
+        fast_pid = PID( 0.19021246, 0.15704399, 0.0, 12.70886655, Ts, u_min, u_max, kb_aw, der_on_meas=True)
 
         # Use the same spacing parameters as stored in the bridge so that the
         # desired distance used by controllers matches what is logged.

@@ -1,5 +1,5 @@
 """
-ROS2 platoon member node, CARLA-agnostic.
+ROS2 platoon member node, CARLA-agnostic like the MCU.
 
 This node:
   * Subscribes to:
