@@ -102,22 +102,22 @@ class PlatoonMember(Node):
         # Hardcoded per-range brake calibration from CARLA test
         #
         # Mapping: desired_decel (m/s^2, positive magnitude) -> brake_cmd [0..1]
-        # using exponential easing between (min_decel -> min_brake)
+        # using linear interpolation between (min_decel -> min_brake)
         # and (max_decel -> max_brake).
         self._low_min_decel = 1.0
         self._low_max_decel = 5.0
-        self._low_min_brake = 0.05
-        self._low_max_brake = 0.50
+        self._low_min_brake = 0.01
+        self._low_max_brake = 0.33
 
         self._mid_min_decel = 1.0
         self._mid_max_decel = 6.0
-        self._mid_min_brake = 0.05
-        self._mid_max_brake = 0.50
+        self._mid_min_brake = 0.01
+        self._mid_max_brake = 0.30
 
         self._high_min_decel = 1.0
         self._high_max_decel = 8.0
-        self._high_min_brake = 0.05
-        self._high_max_brake = 0.50
+        self._high_min_brake = 0.01
+        self._high_max_brake = 0.30
 
         # Gates / hysteresis
         self._dist_on = 1.0
@@ -318,8 +318,7 @@ class PlatoonMember(Node):
             cmd = max_b
         else:
             t = (desired_decel - min_d) / (max_d - min_d)
-            gamma = 6.0
-            cmd = min_b + (math.pow(t, gamma)) * (max_b - min_b)
+            cmd = min_b + t * (max_b - min_b)
 
         # Optional global gain
         cmd = float(self._K_brake) * float(cmd)
@@ -678,21 +677,14 @@ class PlatoonMember(Node):
         self._brake_pub.publish(Float32(data=brake))
         self._local_sp_pub.publish(Float32(data=speed_sp))
 
-        if (
-            (brake > 0.0)
-            or self._dbg_brake_ff
-            or self._dbg_brake_ttc
-            or self._dbg_brake_dist
-            or self._dbg_brake_overspeed
-        ):
-            self.get_logger().info(
-                f"[{self._name}] v={self._speed:.2f} dist={self._dist_to_veh:.2f} "
-                f"sp={speed_sp:.2f} th={throttle:.2f} br={brake:.2f} "
-                f"ff={int(self._dbg_brake_ff)} ttc={int(self._dbg_brake_ttc)} "
-                f"dist={int(self._dbg_brake_dist)} over={int(self._dbg_brake_overspeed)} "
-                f"des_dec={self._desired_decel:.2f} cam_dt={self._dbg_cam_dt:.3f}s "
-                f"cam_dt_wall={self._dbg_cam_dt_wall:.3f}s"
-            )
+        self.get_logger().info(
+            f"[{self._name}] v={self._speed:.2f} dist={self._dist_to_veh:.2f} "
+            f"sp={speed_sp:.2f} th={throttle:.2f} br={brake:.2f} "
+            f"ff={int(self._dbg_brake_ff)} ttc={int(self._dbg_brake_ttc)} "
+            f"dist={int(self._dbg_brake_dist)} over={int(self._dbg_brake_overspeed)} "
+            f"des_dec={self._desired_decel:.2f} cam_dt={self._dbg_cam_dt:.3f}s "
+            f"cam_dt_wall={self._dbg_cam_dt_wall:.3f}s"
+        )
 
         now_sim_s = None
         if self._last_state_stamp is not None:
@@ -701,9 +693,6 @@ class PlatoonMember(Node):
             now_sim_s = float(self._cam_timestamp_ms()) / 1000.0
         if (self._last_cam_pub_sim_s is None) or ((now_sim_s - self._last_cam_pub_sim_s) >= self._cam_min_period_s):
             self._last_cam_pub_sim_s = now_sim_s
-            cam_decel = float(self._desired_decel)
-            if self._platoon_index == 0:
-                cam_decel = max(cam_decel, max(0.0, -float(self._accel_long_mps2)))
             cam_msg = CAM()
             cam_msg.header.protocol_version = 1
             cam_msg.header.message_id = 2
@@ -725,7 +714,7 @@ class PlatoonMember(Node):
                 (1 if brake > 0.01 else 0) | (2 if throttle > 0.01 else 0)
             )
             cam_msg.cam.cam_parameters.high_frequency_container.deceleration_intent = int(
-                self._pack_accel_mps2(cam_decel)
+                self._pack_accel_mps2(self._desired_decel)
             )
             cam_msg.cam.cam_parameters.high_frequency_container.platoon_position = int(self._platoon_index)
             cam_msg.cam.cam_parameters.high_frequency_container.platoon_id = int(self._platoon_id)

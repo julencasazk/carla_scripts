@@ -1,4 +1,3 @@
-
 import argparse
 import math
 import random
@@ -15,6 +14,7 @@ from rclpy.node import Node
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.qos import QoSDurabilityPolicy, QoSProfile, QoSReliabilityPolicy
 from std_msgs.msg import Float32, Bool
+from builtin_interfaces.msg import Time
 from platooning_msgs.msg import VehicleState
 
 from PID import PID
@@ -235,7 +235,7 @@ class FollowingRosTest(Node):
             # signal at the same time, but the leader must react itself before generating and sending
             # signal
             self._desired_time_headways[ros_name] = 1.0 if i == 1 else 0.50
-            self._min_spacings[ros_name] = 8.0
+            self._min_spacings[ros_name] = 8.0 
 
             # State publishers (absolute topics)
             self.state_pubs[ros_name] = self.create_publisher(
@@ -360,7 +360,8 @@ class FollowingRosTest(Node):
         self.lead_speed_setpoints = [
                 5.0,
                 10.0,
-                25.0,
+                0.0,
+                30.0,
                 22.0,
                 10.0,
                 0.0,
@@ -377,7 +378,7 @@ class FollowingRosTest(Node):
         # Minimum time between setpoint changes (in steps)
         self.last_change_step = 0
         self.last_change_speed = 0.0
-        self.band = 0.6
+        self.band = 0.2
         self.min_wait_steps = int(5.0 / self.dt)
 
         # Optional: gate the setpoint test until we see the first throttle command for veh_ego.
@@ -644,7 +645,10 @@ class FollowingRosTest(Node):
 
         # Publish per-vehicle state
         dists = []
-        now_msg = self.get_clock().now().to_msg()
+        sim_sec = float(self.sim_time)
+        now_msg = Time()
+        now_msg.sec = int(sim_sec)
+        now_msg.nanosec = int((sim_sec - float(now_msg.sec)) * 1_000_000_000.0)
         for i, name in enumerate(self.ros_names):
             speed = speeds[i]
 
