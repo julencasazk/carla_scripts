@@ -14,9 +14,64 @@ from rclpy.node import Node
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.qos import QoSDurabilityPolicy, QoSProfile, QoSReliabilityPolicy
 from std_msgs.msg import Float32, Bool
+from platooning_msgs.msg import VehicleState
+from etsi_its_lite_msgs.msg import CAM
 
 from PID import PID
-from PlatooningROS import PlatoonMember
+
+#
+# Test orchestration defaults (edit here for thesis-style standardized tests)
+#
+# The leader setpoint only advances when the leader has been continuously within
+# STABLE_BAND_MPS of the current setpoint for STABLE_HOLD_S seconds of *simulation*
+# time (not wall time).
+STABLE_BAND_MPS = 0.5
+STABLE_HOLD_S = 5.0
+MIN_SEGMENT_S = 2.0
+MAX_SEGMENT_S = 90.0
+
+# Deterministic emergency brake event injected on the leader near the end.
+EMERGENCY_TARGET_SP_MPS = 22.0
+EMERGENCY_BRAKE_CMD = 1.0
+EMERGENCY_BRAKE_DURATION_S = 3.0
+EMERGENCY_RECOVERY_S = 10.0
+
+# Default standardized setpoint plan:
+# - small steps around range midpoints
+# - chatter tests near range boundaries
+# - large cross-range steps
+# - final cruise + injected emergency brake + stop
+DEFAULT_SETPOINT_PLAN = [
+    ("start_stop", 0.0),
+    # Low range (0-40 km/h)
+    ("low_mid", 6.0),
+    ("low_small_up", 7.0),
+    ("low_small_down", 5.0),
+    ("low_bound_lo", 10.5),
+    ("low_bound_hi", 11.5),
+    ("low_bound_lo2", 10.5),
+    # Mid range (40-80 km/h)
+    ("mid_mid", 16.7),
+    ("mid_small_up", 17.7),
+    ("mid_small_down", 15.7),
+    ("mid_bound_lo", 21.5),
+    ("mid_bound_hi", 22.5),
+    ("mid_bound_lo2", 21.5),
+    # High range (80-120 km/h)
+    ("high_mid", 27.8),
+    ("high_small_up", 28.8),
+    ("high_small_down", 26.8),
+    # Larger steps crossing ranges
+    ("big_back_to_0", 0.0),
+    ("big_to_mid", 16.7),
+    ("big_back_to_0_2", 0.0),
+    ("big_to_high", 27.8),
+    ("big_back_to_0_3", 0.0),
+    # Pre-emergency cruise, then emergency is injected deterministically.
+    ("cruise_for_emergency", EMERGENCY_TARGET_SP_MPS),
+    ("_emergency_brake_event", EMERGENCY_TARGET_SP_MPS),
+    ("post_emergency_stop", 0.0),
+]
 
 
 def closest_spawn_point(spawn_points, loc: carla.Location) -> carla.Transform:
@@ -72,6 +127,357 @@ def lane_keep_steer(
     return float(np.clip(steer_gain * steer_angle, -1.0, 1.0))
 
 
+class PlatoonMemberDirectPID(Node):
+    """
+    Platoon member controller using:
+      - VehicleState for ego state
+      - A single gain-scheduled *signed* speed PID (u in [-1,1]) that directly
+        commands throttle (u>0) or brake (u<0).
+    """
+
+    def __init__(
+        self,
+        name: str,
+        platoon_index: int,
+        slow_gains: tuple[float, float, float, float],
+        mid_gains: tuple[float, float, float, float],
+        fast_gains: tuple[float, float, float, float],
+        desired_time_headway: float,
+        min_spacing: float,
+        K_dist: float,
+        K_vel: float,
+        control_period: float,
+        platoon_id: str = "plat_0",
+    ) -> None:
+        super().__init__(name)
+
+        self._name = str(name)
+        self._platoon_index = int(platoon_index)
+        self._preceding_station_id = int(platoon_index - 1) if platoon_index > 0 else None
+
+        self._desired_time_headway = float(desired_time_headway)
+        self._min_spacing = float(min_spacing)
+        self._K_dist = float(K_dist)
+        self._K_vel = float(K_vel)
+        self._control_period = float(control_period)
+
+        # Latest state
+        self._speed = 0.0
+        self._accel_x_mps2 = 0.0
+        self._pos_x_m = 0.0
+        self._pos_y_m = 0.0
+        self._pos_z_m = 0.0
+        self._dist_to_veh = 0.0
+        self._state_stamp = None
+
+        # Setpoints / platoon mode
+        self._setpoint = 0.0
+        self._platoon_sp = 0.0
+        self._platoon_enabled = True
+
+        # Cooperative data from preceding VehicleState (speed only, for vel_diff)
+        self._preceding_speed = 0.0
+        self._preceding_desired_decel = 0.0
+        self._preceding_desired_decel_rx_t = None
+        self._last_cam_rx_wall_t = None
+
+        # Speed-range scheduling (matches PlatooningROSCAM)
+        self._v1 = 11.11
+        self._v2 = 22.22
+        self._h = 1.0
+        self._current_range: str = "low"
+
+        # Signed speed PID, with bumpless gain switching
+        Ts = float(control_period)
+        u_min, u_max = -1.0, 1.0
+        kb_aw = 1.0
+        self._gains_low = tuple(float(x) for x in slow_gains)
+        self._gains_mid = tuple(float(x) for x in mid_gains)
+        self._gains_high = tuple(float(x) for x in fast_gains)
+
+        kp, ki, kd, N = self._gains_low
+        self._pid = PID(
+            kp,
+            ki,
+            kd,
+            N,
+            Ts,
+            u_min,
+            u_max,
+            kb_aw,
+            der_on_meas=True,
+            derivative_disc_method="tustin",
+            integral_disc_method="tustin",
+            anti_windup="clamping",
+        )
+
+        # Actuator deadband/hysteresis to avoid chatter near u=0
+        self._u_db_on = 0.08
+        self._u_db_off = 0.04
+        self._mode = "coast"  # "coast" | "throttle" | "brake"
+        self._u_prev = 0.0
+
+        qos_state = QoSProfile(
+            depth=1,
+            reliability=QoSReliabilityPolicy.BEST_EFFORT,
+            durability=QoSDurabilityPolicy.VOLATILE,
+        )
+        qos_setpoint = QoSProfile(
+            depth=1,
+            reliability=QoSReliabilityPolicy.BEST_EFFORT,
+            durability=QoSDurabilityPolicy.VOLATILE,
+        )
+        qos_cmd = QoSProfile(
+            depth=1,
+            reliability=QoSReliabilityPolicy.BEST_EFFORT,
+            durability=QoSDurabilityPolicy.VOLATILE,
+        )
+
+        self._state_sub = self.create_subscription(
+            VehicleState,
+            f"/{self._name}/state",
+            self._state_cb,
+            qos_state,
+        )
+
+        self._setpoint_sub = self.create_subscription(
+            Float32,
+            f"/{self._name}/state/setpoint",
+            self._setpoint_cb,
+            qos_setpoint,
+        )
+        self._platoon_sp_sub = self.create_subscription(
+            Float32,
+            f"/platoon/{platoon_id}/setpoint",
+            self._platoon_sp_cb,
+            qos_setpoint,
+        )
+        self._platoon_mode_sub = self.create_subscription(
+            Bool,
+            f"/{self._name}/state/platoon_enabled",
+            self._platoon_mode_cb,
+            qos_setpoint,
+        )
+
+        # CAM uses a slightly deeper queue because it is rate-limited (~10Hz)
+        qos_cam = QoSProfile(
+            depth=20,
+            reliability=QoSReliabilityPolicy.BEST_EFFORT,
+            durability=QoSDurabilityPolicy.VOLATILE,
+        )
+
+        # CAM identity + topics (hardcoded station IDs for this project)
+        self._station_id = int(self._platoon_index)
+        self._station_type = 5  # passengerCar
+        self._platoon_id = 0
+        self._cam_topic = f"/veh_{self._station_id}/cam"
+        self._preceding_cam_topic = (
+            f"/veh_{int(self._preceding_station_id)}/cam"
+            if self._preceding_station_id is not None
+            else None
+        )
+
+        self._cam_pub = self.create_publisher(CAM, self._cam_topic, qos_cam)
+        if self._preceding_cam_topic is not None:
+            self._cam_sub = self.create_subscription(
+                CAM,
+                self._preceding_cam_topic,
+                self._cam_cb,
+                qos_cam,
+            )
+        else:
+            self._cam_sub = None
+
+        # CAM publish rate limiting (ETSI CAM is typically ~10 Hz)
+        self._cam_min_period_s = 0.1
+        self._last_cam_pub_sim_s = None
+
+        self._throttle_pub = self.create_publisher(Float32, f"/{self._name}/command/throttle", qos_cmd)
+        self._brake_pub = self.create_publisher(Float32, f"/{self._name}/command/brake", qos_cmd)
+        self._local_sp_pub = self.create_publisher(Float32, f"/{self._name}/state/local_setpoint", qos_state)
+
+    def _state_cb(self, msg: VehicleState) -> None:
+        self._state_stamp = msg.timestamp
+        self._pos_x_m = float(msg.pos_x_m)
+        self._pos_y_m = float(msg.pos_y_m)
+        self._pos_z_m = float(msg.pos_z_m)
+        self._speed = float(msg.speed_mps)
+        self._accel_x_mps2 = float(msg.accel_mps2)
+        self._dist_to_veh = float(msg.dist_to_prev)
+
+    def _setpoint_cb(self, msg: Float32) -> None:
+        self._setpoint = float(msg.data)
+
+    def _platoon_sp_cb(self, msg: Float32) -> None:
+        self._platoon_sp = float(msg.data)
+
+    def _platoon_mode_cb(self, msg: Bool) -> None:
+        self._platoon_enabled = bool(msg.data)
+
+    def _cam_cb(self, msg: CAM) -> None:
+        speed_raw = int(msg.cam.cam_parameters.high_frequency_container.speed)
+        decel_raw = int(msg.cam.cam_parameters.high_frequency_container.deceleration_intent)
+        self._preceding_speed = float(speed_raw) / 100.0
+        self._preceding_desired_decel = max(0.0, float(decel_raw) / 10.0)
+        self._preceding_desired_decel_rx_t = time.monotonic()
+        self._last_cam_rx_wall_t = time.perf_counter()
+
+    def _cam_timestamp_ms(self) -> int:
+        if self._state_stamp is None:
+            now = self.get_clock().now().to_msg()
+            ts_ms = int(now.sec * 1000 + now.nanosec // 1_000_000)
+            return int(ts_ms % 4294967296)
+        ts_ms = int(self._state_stamp.sec * 1000 + self._state_stamp.nanosec // 1_000_000)
+        return int(ts_ms % 4294967296)
+
+    @staticmethod
+    def _pack_speed_mps(speed_mps: float) -> int:
+        return int(max(0, min(65535, round(float(speed_mps) * 100.0))))
+
+    @staticmethod
+    def _pack_accel_mps2(accel_mps2: float) -> int:
+        return int(max(0, min(255, round(abs(float(accel_mps2)) * 10.0))))
+
+    @staticmethod
+    def _pack_position_m(pos_m: float) -> int:
+        return int(max(0, min(4294967295, round(float(pos_m) * 100.0))))
+
+    def _update_speed_range(self, speed: float) -> bool:
+        prev = self._current_range
+        if self._current_range == "low":
+            if speed > self._v1 + self._h:
+                self._current_range = "mid"
+        elif self._current_range == "mid":
+            if speed > self._v2 + self._h:
+                self._current_range = "high"
+            elif speed < self._v1 - self._h:
+                self._current_range = "low"
+        else:
+            if speed < self._v2 - self._h:
+                self._current_range = "mid"
+        return self._current_range != prev
+
+    def _compute_speed_setpoint(self) -> float:
+        # Choose base setpoint
+        base_sp = float(self._platoon_sp) if self._platoon_enabled else float(self._setpoint)
+
+        # Leader: no distance logic
+        if self._platoon_index == 0:
+            return max(0.0, min(33.33, base_sp))
+
+        # If no distance, fall back to base setpoint
+        if self._dist_to_veh <= 0.0:
+            return max(0.0, min(33.33, base_sp))
+
+        # Desired dist = max(min_spacing+3, v*T + min_spacing)
+        v = float(self._speed)
+        desired_dist = max(float(self._min_spacing) + 3.0, v * float(self._desired_time_headway) + float(self._min_spacing))
+        dist_err = float(self._dist_to_veh) - float(desired_dist)
+
+        v_lead = float(self._preceding_speed) if self._preceding_speed is not None else v
+        vel_diff = float(v_lead) - float(v)
+
+        if dist_err >= 0.0:
+            d_sp = float(self._K_dist) * dist_err + float(self._K_vel) * vel_diff
+        else:
+            d_sp = 4.0 * (float(self._K_dist) * dist_err + float(self._K_vel) * vel_diff)
+
+        eff_sp = float(base_sp) + float(d_sp)
+        eff_sp = min(eff_sp, 33.33)
+        eff_sp = max(eff_sp, 0.0)
+        return float(eff_sp)
+
+    def _apply_mode_hysteresis(self, u: float) -> tuple[float, float, str]:
+        u = float(u)
+        if self._mode == "coast":
+            if u >= self._u_db_on:
+                self._mode = "throttle"
+            elif u <= -self._u_db_on:
+                self._mode = "brake"
+        elif self._mode == "throttle":
+            if u <= -self._u_db_on:
+                self._mode = "brake"
+            elif u < self._u_db_off:
+                self._mode = "coast"
+        else:  # brake
+            if u >= self._u_db_on:
+                self._mode = "throttle"
+            elif u > -self._u_db_off:
+                self._mode = "coast"
+
+        if self._mode == "throttle":
+            return max(0.0, min(1.0, u)), 0.0, self._mode
+        if self._mode == "brake":
+            return 0.0, max(0.0, min(1.0, -u)), self._mode
+        return 0.0, 0.0, self._mode
+
+    def step_once(self) -> None:
+        speed_sp = self._compute_speed_setpoint()
+        speed_meas = float(self._speed)
+
+        # Gain scheduling using a single PID instance + bumpless tuning
+        if self._update_speed_range(speed_meas):
+            if self._current_range == "mid":
+                gains = self._gains_mid
+            elif self._current_range == "high":
+                gains = self._gains_high
+            else:
+                gains = self._gains_low
+            kp, ki, kd, N = gains
+            self._pid.set_gains_bumpless(kp, ki, kd, N, float(speed_sp), float(speed_meas), float(self._u_prev))
+
+        u = float(self._pid.step(float(speed_sp), float(speed_meas)))
+        throttle, brake, mode = self._apply_mode_hysteresis(u)
+        self._u_prev = float(u)
+
+        self._throttle_pub.publish(Float32(data=float(throttle)))
+        self._brake_pub.publish(Float32(data=float(brake)))
+        self._local_sp_pub.publish(Float32(data=float(speed_sp)))
+
+        # Publish CAM (rate-limited) so following logic matches PlatooningROSCAM.
+        now_sim_s = None
+        if self._state_stamp is not None:
+            now_sim_s = float(self._state_stamp.sec) + float(self._state_stamp.nanosec) * 1e-9
+        if now_sim_s is None:
+            now_sim_s = float(self._cam_timestamp_ms()) / 1000.0
+
+        if (self._last_cam_pub_sim_s is None) or (
+            (float(now_sim_s) - float(self._last_cam_pub_sim_s)) >= float(self._cam_min_period_s)
+        ):
+            self._last_cam_pub_sim_s = float(now_sim_s)
+
+            # For this "single signed PID" system we don't have an explicit desired decel,
+            # so we encode the measured longitudinal decel magnitude as intent (leader-like).
+            cam_decel = max(0.0, -float(self._accel_x_mps2))
+
+            cam_msg = CAM()
+            cam_msg.header.protocol_version = 1
+            cam_msg.header.message_id = 2
+            cam_msg.header.station_id = int(self._station_id)
+            cam_msg.cam.timestamp = int(self._cam_timestamp_ms())
+            cam_msg.cam.cam_parameters.basic_container.station_type = int(self._station_type)
+            cam_msg.cam.cam_parameters.basic_container.reference_position = [
+                int(self._pack_position_m(self._pos_x_m)),
+                int(self._pack_position_m(self._pos_y_m)),
+                int(self._pack_position_m(self._pos_z_m)),
+            ]
+            cam_msg.cam.cam_parameters.high_frequency_container.speed = int(
+                self._pack_speed_mps(self._speed)
+            )
+            cam_msg.cam.cam_parameters.high_frequency_container.longitudinal_acceleration = int(
+                self._pack_accel_mps2(self._accel_x_mps2)
+            )
+            cam_msg.cam.cam_parameters.high_frequency_container.aceleration_control = int(
+                (1 if float(brake) > 0.01 else 0) | (2 if float(throttle) > 0.01 else 0)
+            )
+            cam_msg.cam.cam_parameters.high_frequency_container.deceleration_intent = int(
+                self._pack_accel_mps2(cam_decel)
+            )
+            cam_msg.cam.cam_parameters.high_frequency_container.platoon_position = int(self._platoon_index)
+            cam_msg.cam.cam_parameters.high_frequency_container.platoon_id = int(self._platoon_id)
+            self._cam_pub.publish(cam_msg)
+
+
 class FollowingRosTest(Node):
 
     def __init__(self, args: argparse.Namespace) -> None:
@@ -114,8 +520,7 @@ class FollowingRosTest(Node):
 
         # Per-vehicle ROS publishers (filled after spawning vehicles)
         self.ros_names = []
-        self.speed_pubs = {}
-        self.dist_pubs = {}
+        self.state_pubs = {}
         self.platoon_mode_pubs = {}
         self._mcu_setpoint_pub = None
 
@@ -176,9 +581,9 @@ class FollowingRosTest(Node):
         settings.synchronous_mode = True
         settings.fixed_delta_seconds = self.Ts
         settings.no_rendering_mode = False
-        #settings.substepping = True
-        #settings.max_substep_delta_time = 0.001
-        #settings.max_substeps = 10 # Trying this to hopefully make the physics more reliable
+        settings.substepping = True
+        settings.max_substep_delta_time = 0.001
+        settings.max_substeps = 10 # Trying this to hopefully make the physics more reliable
         world.apply_settings(settings)
         self.get_logger().info(f"Synchronous mode ON, dt = {self.Ts} s")
 
@@ -233,15 +638,12 @@ class FollowingRosTest(Node):
             # First follower (second member) leaves more room as everyone receives a emergency stop
             # signal at the same time, but the leader must react itself before generating and sending
             # signal
-            self._desired_time_headways[ros_name] = 0.3 if i == 1 else 0.10
-            self._min_spacings[ros_name] = 4.0 
+            self._desired_time_headways[ros_name] = 0.7 if i == 1 else 0.5
+            self._min_spacings[ros_name] = 8.0 
 
-            # State publishers (absolute topics)
-            self.speed_pubs[ros_name] = self.create_publisher(
-                Float32, f"/{ros_name}/state/speed", self.qos_state
-            )
-            self.dist_pubs[ros_name] = self.create_publisher(
-                Float32, f"/{ros_name}/state/dist_to_veh", self.qos_state
+            # State publisher (VehicleState)
+            self.state_pubs[ros_name] = self.create_publisher(
+                VehicleState, f"/{ros_name}/state", self.qos_state
             )
             self.platoon_mode_pubs[ros_name] = self.create_publisher(
                 Bool, f"/{ros_name}/state/platoon_enabled", self.qos_setpoint
@@ -323,10 +725,23 @@ class FollowingRosTest(Node):
         self.csv_file = open(csv_filename, mode="w", newline="")
         self.csv_writer = csv.writer(self.csv_file)
 
-        # Build header: time_s, teleport_event (0/1), then for each vehicle a block of
+        # Build header:
+        # - time_s, teleport_event (0/1)
+        # - standardized test plan state (global SP, stability, emergency flag)
+        # - then for each vehicle a block of
         # throttle_<name>, brake_<name>, speed_<name>, accel_x_<name>,
         # local_sp_<name>, dist_to_prev_<name>, desired_dist_<name>, dist_err_<name>, vel_diff_<name>, ttc_<name>
-        header = ["time_s", "teleport_event"]
+        header = [
+            "time_s",
+            "teleport_event",
+            "global_sp_mps",
+            "plan_idx",
+            "plan_name",
+            "leader_speed_mps",
+            "leader_in_band",
+            "leader_stable_s",
+            "emergency_active",
+        ]
         for i, name in enumerate(self.ros_names):
             suffix = str(i)
             header.extend([
@@ -358,30 +773,35 @@ class FollowingRosTest(Node):
         self.dist_since_tp_m = 0.0
         self.last_lead_loc = None
 
-        # Lead speed setpoints (global platoon reference, m/s)
-        self.lead_speed_setpoints = [
-                5.0,
-                10.0,
-                0.0,
-                30.0,
-                22.0,
-                10.0,
-                0.0,
+        # --- Standardized setpoint test plan (leader global setpoint) ---
+        # Each segment advances when the leader is stable within STABLE_BAND_MPS
+        # for STABLE_HOLD_S seconds of sim time (continuous in-band), plus a small
+        # minimum segment duration to avoid accidental fast transitions.
+        self._plan = []
+        for name, sp_mps in list(DEFAULT_SETPOINT_PLAN):
+            seg_type = "emergency" if str(name).startswith("_emergency") else "setpoint"
+            self._plan.append({"type": seg_type, "name": str(name), "sp_mps": float(sp_mps)})
 
-        ]
+        self._plan_idx = 0
+        self._segment_start_sim_t = 0.0
+        self._leader_stable_steps = 0
+        self._leader_in_band = 0
+        self._leader_stable_s = 0.0
+        self._global_sp_mps = float(self._plan[0]["sp_mps"]) if self._plan else 0.0
 
-        self.lead_sp_idx = 0
+        # Emergency event state (deterministic leader brake hijack)
+        self._emergency_active = False
+        # What was actually applied in the last apply_controls() call (i.e. for the tick we just advanced).
+        self._emergency_active_applied = False
+        self._emergency_brake_end_s = None
+        self._emergency_recovery_end_s = None
+
         self.finished = False
 
         # State for stability-based setpoint changes
         self.sim_time = 0.0
         self.start_timestamp = None
         self.step = 0
-        # Minimum time between setpoint changes (in steps)
-        self.last_change_step = 0
-        self.last_change_speed = 0.0
-        self.band = 0.2
-        self.min_wait_steps = int(5.0 / self.dt)
 
         # Optional: gate the setpoint test until we see the first throttle command for veh_ego.
         # Default OFF because it can deadlock if the MCU only publishes after seeing a nonzero setpoint.
@@ -465,8 +885,6 @@ class FollowingRosTest(Node):
             if self.mcu_ros_name is not None and name == self.mcu_ros_name and self.gate_on_first_throttle and not self._test_started:
                 self._test_started = True
                 self._test_started_step = self.step
-                self.last_change_step = self.step
-                self.last_change_speed = 0.0
                 self.get_logger().info(
                     f"Test sequence enabled after first MCU throttle message ({name}) (step={self.step})."
                 )
@@ -633,23 +1051,105 @@ class FollowingRosTest(Node):
         # Cache for use by the optional leader brake injector.
         self._last_speeds = list(speeds)
 
-        # Current global lead speed setpoint.
+        # Current global leader speed setpoint (standardized test plan).
         # Optionally hold SP at 0 until first veh_ego throttle is received.
-        sp = self.lead_speed_setpoints[self.lead_sp_idx] if self._test_started else 0.0
-        if self._first_nonzero_sp_step is None and sp > 1e-6:
+        leader_speed = float(speeds[0]) if speeds else 0.0
+        plan_idx = int(self._plan_idx)
+        plan_name = str(self._plan[plan_idx]["name"]) if self._plan else "none"
+
+        if not self._test_started:
+            sp = 0.0
+            self._leader_in_band = 0
+            self._leader_stable_steps = 0
+            self._leader_stable_s = 0.0
+        else:
+            # Initialize segment timing when the plan effectively starts.
+            if self._test_started_step is not None and self.step == int(self._test_started_step):
+                self._segment_start_sim_t = float(self.sim_time)
+                self._leader_stable_steps = 0
+                self._leader_stable_s = 0.0
+
+            seg = self._plan[plan_idx] if self._plan else {"type": "setpoint", "name": "none", "sp_mps": 0.0}
+            sp = float(seg.get("sp_mps", 0.0))
+            self._global_sp_mps = float(sp)
+
+            seg_elapsed_s = float(self.sim_time) - float(self._segment_start_sim_t)
+            in_band = 1 if abs(float(leader_speed) - float(sp)) <= float(STABLE_BAND_MPS) else 0
+            self._leader_in_band = int(in_band)
+            if in_band:
+                self._leader_stable_steps += 1
+            else:
+                self._leader_stable_steps = 0
+            self._leader_stable_s = float(self._leader_stable_steps) * float(self.dt)
+
+            # Plan advancement logic
+            advance = False
+            reason = None
+            if seg.get("type") == "setpoint":
+                if (seg_elapsed_s >= float(MIN_SEGMENT_S)) and (self._leader_stable_s >= float(STABLE_HOLD_S)):
+                    advance = True
+                    reason = f"stable {self._leader_stable_s:.2f}s"
+                elif seg_elapsed_s >= float(MAX_SEGMENT_S):
+                    advance = True
+                    reason = f"timeout {seg_elapsed_s:.2f}s"
+            else:
+                # Emergency segment: override leader brake for a fixed duration, then
+                # allow a recovery window, while keeping the setpoint constant.
+                if self._emergency_brake_end_s is None and self._emergency_recovery_end_s is None:
+                    # Start emergency immediately upon entering this segment.
+                    self._emergency_active = True
+                    self._emergency_brake_end_s = float(self.sim_time) + float(EMERGENCY_BRAKE_DURATION_S)
+                    self._emergency_recovery_end_s = float(self._emergency_brake_end_s) + float(EMERGENCY_RECOVERY_S)
+                    self.get_logger().info(
+                        f"EMERGENCY BRAKE START: t={self.sim_time:.2f}s cmd={float(EMERGENCY_BRAKE_CMD):.2f} "
+                        f"duration={float(EMERGENCY_BRAKE_DURATION_S):.2f}s"
+                    )
+
+                if self._emergency_brake_end_s is not None and self._emergency_active and float(self.sim_time) >= float(self._emergency_brake_end_s):
+                    self._emergency_active = False
+                    self.get_logger().info(f"EMERGENCY BRAKE END: t={self.sim_time:.2f}s")
+
+                if self._emergency_recovery_end_s is not None and float(self.sim_time) >= float(self._emergency_recovery_end_s):
+                    advance = True
+                    reason = "emergency complete"
+
+            if advance and self._plan:
+                prev_name = plan_name
+                if self._plan_idx >= (len(self._plan) - 1):
+                    self.finished = True
+                    self.get_logger().info(f"Plan finished at t={self.sim_time:.2f}s (last segment={prev_name}).")
+                else:
+                    self._plan_idx += 1
+                    plan_idx = int(self._plan_idx)
+                    plan_name = str(self._plan[plan_idx]["name"])
+                    self._segment_start_sim_t = float(self.sim_time)
+                    self._leader_stable_steps = 0
+                    self._leader_stable_s = 0.0
+                    # Reset emergency state when leaving emergency segment.
+                    self._emergency_active = False
+                    self._emergency_brake_end_s = None
+                    self._emergency_recovery_end_s = None
+                    self.get_logger().info(
+                        f"Plan advance: {prev_name} -> {plan_name} at t={self.sim_time:.2f}s (reason={reason})"
+                    )
+                    sp = float(self._plan[plan_idx].get("sp_mps", 0.0))
+                    self._global_sp_mps = float(sp)
+
+        if self._first_nonzero_sp_step is None and float(sp) > 1e-6:
             self._first_nonzero_sp_step = self.step
             self.get_logger().info(
                 f"First nonzero platoon setpoint published at step={self.step} sim_t={self.sim_time:.3f}s sp={float(sp):.3f}"
             )
+
         self.platoon_sp_pub.publish(Float32(data=float(sp)))
         if self._mcu_setpoint_pub is not None:
             self._mcu_setpoint_pub.publish(Float32(data=float(sp)))
 
         # Publish per-vehicle state
         dists = []
+        now_msg = self.get_clock().now().to_msg()
         for i, name in enumerate(self.ros_names):
             speed = speeds[i]
-            self.speed_pubs[name].publish(Float32(data=float(speed)))
 
             if i == 0:
                 dist_to_prev = 0.0
@@ -660,8 +1160,17 @@ class FollowingRosTest(Node):
                     (tf.location.x, tf.location.y, tf.location.z),
                     (prev_tf.location.x, prev_tf.location.y, prev_tf.location.z),
                 )
-            self.dist_pubs[name].publish(Float32(data=float(dist_to_prev)))
             dists.append(dist_to_prev)
+
+            state_msg = VehicleState()
+            state_msg.timestamp = now_msg
+            state_msg.pos_x_m = float(transforms[i].location.x)
+            state_msg.pos_y_m = float(transforms[i].location.y)
+            state_msg.pos_z_m = float(transforms[i].location.z)
+            state_msg.speed_mps = float(speed)
+            state_msg.accel_mps2 = float(accels[i].x)
+            state_msg.dist_to_prev = float(dist_to_prev)
+            self.state_pubs[name].publish(state_msg)
 
         # Compute desired distances according to spacing policy used in
         # the Python platooning logic: max(min_spacing + 3.0, v*T + min_spacing)
@@ -705,28 +1214,21 @@ class FollowingRosTest(Node):
             else:
                 ttcs.append(float("inf"))
 
-        # Step logic to change lead SP when ego settles (matches Python script).
-        # Only start sequencing once the test is enabled (or if no MCU is used).
-        if (self._test_started or self.mcu_index is None) and self.plen > 1 and (self.step - self.last_change_step) >= self.min_wait_steps:
-            ego_speed = float(speeds[self.ego_index])
-            if abs(ego_speed - self.last_change_speed) <= self.band:
-                if self.lead_sp_idx == (len(self.lead_speed_setpoints) - 1):
-                    self.finished = True
-                else:
-                    self.lead_sp_idx = (self.lead_sp_idx + 1) % len(self.lead_speed_setpoints)
-                self.get_logger().info(
-                    f"Lead SP change to {self.lead_speed_setpoints[self.lead_sp_idx]:.3f} m/s "
-                    f"at t={self.sim_time:.2f}s (ego speed: {ego_speed:.2f} m/s)"
-                )
-                self.last_change_step = self.step
-                self.last_change_speed = ego_speed
-            else:
-                self.last_change_step = self.step
-                self.last_change_speed = ego_speed
+        # Note: plan advancement is handled above via leader stability gating.
 
         # Logging to CSV: per-vehicle throttle, brake, speed, accel_x,
         # local setpoint, distance to previous, desired distance, dist_err, vel_diff, ttc
-        row = [f"{self.sim_time:.4f}", str(int(self._teleport_event))]
+        row = [
+            f"{self.sim_time:.4f}",
+            str(int(self._teleport_event)),
+            f"{float(sp):.4f}",
+            str(int(plan_idx)),
+            str(plan_name),
+            f"{float(leader_speed):.4f}",
+            str(int(self._leader_in_band)),
+            f"{float(self._leader_stable_s):.4f}",
+            str(int(self._emergency_active_applied)),
+        ]
         for i, name in enumerate(self.ros_names):
             cmd = self._last_cmd.get(name, {"throttle": 0.0, "brake": 0.0})
             throttle = float(cmd["throttle"])
@@ -765,13 +1267,32 @@ class FollowingRosTest(Node):
         the commands computed on the previous tick are used for the next
         simulation step.
         """
+        # Capture the emergency flag for the controls we are about to apply.
+        self._emergency_active_applied = bool(getattr(self, "_emergency_active", False))
+
         for name, v in zip(self.ros_names, self.vehicles):
             cmd = self._last_cmd.get(name, {"throttle": 0.0, "brake": 0.0})
             throttle_cmd = max(0.0, min(1.0, float(cmd["throttle"])))
             brake_cmd = max(0.0, min(1.0, float(cmd["brake"])))
 
+            # Deterministic emergency brake hijack on the leader (used by the
+            # standardized test plan). This overrides the controller output.
+            if name == self._leader_name and bool(self._emergency_active_applied):
+                throttle_cmd = 0.0
+                brake_cmd = max(float(brake_cmd), float(EMERGENCY_BRAKE_CMD))
+                try:
+                    self._last_cmd[name]["throttle"] = float(throttle_cmd)
+                    self._last_cmd[name]["brake"] = float(brake_cmd)
+                except Exception:
+                    pass
+
             # Optional: inject mild random brake pulses on the leader.
-            if self._leader_brake_enabled and name == self._leader_name and self._leader_rng is not None:
+            if (
+                self._leader_brake_enabled
+                and name == self._leader_name
+                and self._leader_rng is not None
+                and (not bool(self._emergency_active_applied))
+            ):
                 sim_t = float(self.sim_time)
                 leader_speed = None
                 try:
@@ -1023,7 +1544,7 @@ def main():
 
     # PID scheduling gains (match following_python_test.py / Platooning.py)
     kb_aw = 1.0
-    u_min, u_max = -1.0, 1.0 # TODO Bound to 0.0 to 1.0 and let brake arbiter deal with braking
+    u_min, u_max = -1.0, 1.0
 
     nodes = [bridge]
     for i, name in enumerate(bridge.ros_names):
@@ -1046,27 +1567,18 @@ def main():
         desired_time_headway = float(bridge._desired_time_headways.get(name, 0.3))
         min_spacing = float(bridge._min_spacings.get(name, 5.0))
 
-        member = PlatoonMember(
+        member = PlatoonMemberDirectPID(
             name=name,
             platoon_index=platoon_index,
-            slow_pid=slow_pid,
-            mid_pid=mid_pid,
-            fast_pid=fast_pid,
+            slow_gains=(slow_pid.kp, slow_pid.ki, slow_pid.kd, slow_pid.n),
+            mid_gains=(mid_pid.kp, mid_pid.ki, mid_pid.kd, mid_pid.n),
+            fast_gains=(fast_pid.kp, fast_pid.ki, fast_pid.kd, fast_pid.n),
             desired_time_headway=desired_time_headway,
             min_spacing=min_spacing,
             K_dist=1.0,
-            K_vel=1.0,
-            K_brake=2.0,
+            K_vel=0.0,
             control_period=Ts,
         )
-
-        # We drive the control loop explicitly via step_once() once per
-        # CARLA tick in the main loop below. Disable the internal timer so
-        # the PID is stepped exactly at Ts = 0.01 s, matching its tuning.
-        try:
-            member._timer.cancel()
-        except Exception:
-            pass
 
         nodes.append(member)
 
@@ -1116,7 +1628,7 @@ def main():
 
             # Run one control update per PlatoonMember (deterministic per-tick).
             for n in nodes:
-                if isinstance(n, PlatoonMember):
+                if isinstance(n, PlatoonMemberDirectPID):
                     n.step_once()
 
             # From here until the next tick boundary, keep spinning so:

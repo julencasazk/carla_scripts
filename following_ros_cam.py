@@ -20,6 +20,51 @@ from platooning_msgs.msg import VehicleState
 from PID import PID
 from PlatooningROSCAM import PlatoonMember
 
+#
+# Test orchestration defaults (edit here for thesis-style standardized tests)
+#
+STABLE_BAND_MPS = 0.5
+STABLE_HOLD_S = 5.0
+MIN_SEGMENT_S = 2.0
+MAX_SEGMENT_S = 90.0
+
+EMERGENCY_TARGET_SP_MPS = 22.0
+EMERGENCY_BRAKE_CMD = 1.0
+EMERGENCY_BRAKE_DURATION_S = 3.0
+EMERGENCY_RECOVERY_S = 10.0
+
+DEFAULT_SETPOINT_PLAN = [
+    ("start_stop", 0.0),
+    # Low range (0-40 km/h)
+    ("low_mid", 6.0),
+    ("low_small_up", 7.0),
+    ("low_small_down", 5.0),
+    ("low_bound_lo", 10.5),
+    ("low_bound_hi", 11.5),
+    ("low_bound_lo2", 10.5),
+    # Mid range (40-80 km/h)
+    ("mid_mid", 16.7),
+    ("mid_small_up", 17.7),
+    ("mid_small_down", 15.7),
+    ("mid_bound_lo", 21.5),
+    ("mid_bound_hi", 22.5),
+    ("mid_bound_lo2", 21.5),
+    # High range (80-120 km/h)
+    ("high_mid", 27.8),
+    ("high_small_up", 28.8),
+    ("high_small_down", 26.8),
+    # Larger steps crossing ranges
+    ("big_back_to_0", 0.0),
+    ("big_to_mid", 16.7),
+    ("big_back_to_0_2", 0.0),
+    ("big_to_high", 27.8),
+    ("big_back_to_0_3", 0.0),
+    # Pre-emergency cruise, then emergency is injected deterministically.
+    ("cruise_for_emergency", EMERGENCY_TARGET_SP_MPS),
+    ("_emergency_brake_event", EMERGENCY_TARGET_SP_MPS),
+    ("post_emergency_stop", 0.0),
+]
+
 
 def closest_spawn_point(spawn_points, loc: carla.Location) -> carla.Transform:
     """Return the spawn point (Transform) whose location is closest to loc."""
@@ -321,10 +366,23 @@ class FollowingRosTest(Node):
         self.csv_file = open(csv_filename, mode="w", newline="")
         self.csv_writer = csv.writer(self.csv_file)
 
-        # Build header: time_s, teleport_event (0/1), then for each vehicle a block of
+        # Build header:
+        # - time_s, teleport_event (0/1)
+        # - standardized test plan state (global SP, stability, emergency flag)
+        # - then for each vehicle a block of
         # throttle_<name>, brake_<name>, speed_<name>, accel_x_<name>,
         # local_sp_<name>, dist_to_prev_<name>, desired_dist_<name>, dist_err_<name>, vel_diff_<name>, ttc_<name>
-        header = ["time_s", "teleport_event"]
+        header = [
+            "time_s",
+            "teleport_event",
+            "global_sp_mps",
+            "plan_idx",
+            "plan_name",
+            "leader_speed_mps",
+            "leader_in_band",
+            "leader_stable_s",
+            "emergency_active",
+        ]
         for i, name in enumerate(self.ros_names):
             suffix = str(i)
             header.extend([
@@ -356,29 +414,32 @@ class FollowingRosTest(Node):
         self.dist_since_tp_m = 0.0
         self.last_lead_loc = None
 
-        # Lead speed setpoints (global platoon reference, m/s)
-        self.lead_speed_setpoints = [
-                5.0,
-                10.0,
-                25.0,
-                22.0,
-                10.0,
-                0.0,
+        # --- Standardized setpoint test plan (leader global setpoint) ---
+        self._plan = []
+        for name, sp_mps in list(DEFAULT_SETPOINT_PLAN):
+            seg_type = "emergency" if str(name).startswith("_emergency") else "setpoint"
+            self._plan.append({"type": seg_type, "name": str(name), "sp_mps": float(sp_mps)})
 
-        ]
+        self._plan_idx = 0
+        self._segment_start_sim_t = 0.0
+        self._leader_stable_steps = 0
+        self._leader_in_band = 0
+        self._leader_stable_s = 0.0
+        self._global_sp_mps = float(self._plan[0]["sp_mps"]) if self._plan else 0.0
 
-        self.lead_sp_idx = 0
+        # Emergency event state (deterministic leader brake hijack)
+        self._emergency_active = False
+        # What was actually applied in the last apply_controls() call (i.e. for the tick we just advanced).
+        self._emergency_active_applied = False
+        self._emergency_brake_end_s = None
+        self._emergency_recovery_end_s = None
+
         self.finished = False
 
         # State for stability-based setpoint changes
         self.sim_time = 0.0
         self.start_timestamp = None
         self.step = 0
-        # Minimum time between setpoint changes (in steps)
-        self.last_change_step = 0
-        self.last_change_speed = 0.0
-        self.band = 0.6
-        self.min_wait_steps = int(5.0 / self.dt)
 
         # Optional: gate the setpoint test until we see the first throttle command for veh_ego.
         # Default OFF because it can deadlock if the MCU only publishes after seeing a nonzero setpoint.
@@ -462,8 +523,6 @@ class FollowingRosTest(Node):
             if self.mcu_ros_name is not None and name == self.mcu_ros_name and self.gate_on_first_throttle and not self._test_started:
                 self._test_started = True
                 self._test_started_step = self.step
-                self.last_change_step = self.step
-                self.last_change_speed = 0.0
                 self.get_logger().info(
                     f"Test sequence enabled after first MCU throttle message ({name}) (step={self.step})."
                 )
@@ -630,14 +689,95 @@ class FollowingRosTest(Node):
         # Cache for use by the optional leader brake injector.
         self._last_speeds = list(speeds)
 
-        # Current global lead speed setpoint.
+        # Current global leader speed setpoint (standardized test plan).
         # Optionally hold SP at 0 until first veh_ego throttle is received.
-        sp = self.lead_speed_setpoints[self.lead_sp_idx] if self._test_started else 0.0
-        if self._first_nonzero_sp_step is None and sp > 1e-6:
+        leader_speed = float(speeds[0]) if speeds else 0.0
+        plan_idx = int(self._plan_idx)
+        plan_name = str(self._plan[plan_idx]["name"]) if self._plan else "none"
+
+        if not self._test_started:
+            sp = 0.0
+            self._leader_in_band = 0
+            self._leader_stable_steps = 0
+            self._leader_stable_s = 0.0
+        else:
+            # Initialize segment timing when the plan effectively starts.
+            if self._test_started_step is not None and self.step == int(self._test_started_step):
+                self._segment_start_sim_t = float(self.sim_time)
+                self._leader_stable_steps = 0
+                self._leader_stable_s = 0.0
+
+            seg = self._plan[plan_idx] if self._plan else {"type": "setpoint", "name": "none", "sp_mps": 0.0}
+            sp = float(seg.get("sp_mps", 0.0))
+            self._global_sp_mps = float(sp)
+
+            seg_elapsed_s = float(self.sim_time) - float(self._segment_start_sim_t)
+            in_band = 1 if abs(float(leader_speed) - float(sp)) <= float(STABLE_BAND_MPS) else 0
+            self._leader_in_band = int(in_band)
+            if in_band:
+                self._leader_stable_steps += 1
+            else:
+                self._leader_stable_steps = 0
+            self._leader_stable_s = float(self._leader_stable_steps) * float(self.dt)
+
+            # Plan advancement logic
+            advance = False
+            reason = None
+            if seg.get("type") == "setpoint":
+                if (seg_elapsed_s >= float(MIN_SEGMENT_S)) and (self._leader_stable_s >= float(STABLE_HOLD_S)):
+                    advance = True
+                    reason = f"stable {self._leader_stable_s:.2f}s"
+                elif seg_elapsed_s >= float(MAX_SEGMENT_S):
+                    advance = True
+                    reason = f"timeout {seg_elapsed_s:.2f}s"
+            else:
+                # Emergency segment: override leader brake for a fixed duration, then
+                # allow a recovery window, while keeping the setpoint constant.
+                if self._emergency_brake_end_s is None and self._emergency_recovery_end_s is None:
+                    self._emergency_active = True
+                    self._emergency_brake_end_s = float(self.sim_time) + float(EMERGENCY_BRAKE_DURATION_S)
+                    self._emergency_recovery_end_s = float(self._emergency_brake_end_s) + float(EMERGENCY_RECOVERY_S)
+                    self.get_logger().info(
+                        f"EMERGENCY BRAKE START: t={self.sim_time:.2f}s cmd={float(EMERGENCY_BRAKE_CMD):.2f} "
+                        f"duration={float(EMERGENCY_BRAKE_DURATION_S):.2f}s"
+                    )
+
+                if self._emergency_brake_end_s is not None and self._emergency_active and float(self.sim_time) >= float(self._emergency_brake_end_s):
+                    self._emergency_active = False
+                    self.get_logger().info(f"EMERGENCY BRAKE END: t={self.sim_time:.2f}s")
+
+                if self._emergency_recovery_end_s is not None and float(self.sim_time) >= float(self._emergency_recovery_end_s):
+                    advance = True
+                    reason = "emergency complete"
+
+            if advance and self._plan:
+                prev_name = plan_name
+                if self._plan_idx >= (len(self._plan) - 1):
+                    self.finished = True
+                    self.get_logger().info(f"Plan finished at t={self.sim_time:.2f}s (last segment={prev_name}).")
+                else:
+                    self._plan_idx += 1
+                    plan_idx = int(self._plan_idx)
+                    plan_name = str(self._plan[plan_idx]["name"])
+                    self._segment_start_sim_t = float(self.sim_time)
+                    self._leader_stable_steps = 0
+                    self._leader_stable_s = 0.0
+                    # Reset emergency state when leaving emergency segment.
+                    self._emergency_active = False
+                    self._emergency_brake_end_s = None
+                    self._emergency_recovery_end_s = None
+                    self.get_logger().info(
+                        f"Plan advance: {prev_name} -> {plan_name} at t={self.sim_time:.2f}s (reason={reason})"
+                    )
+                    sp = float(self._plan[plan_idx].get("sp_mps", 0.0))
+                    self._global_sp_mps = float(sp)
+
+        if self._first_nonzero_sp_step is None and float(sp) > 1e-6:
             self._first_nonzero_sp_step = self.step
             self.get_logger().info(
                 f"First nonzero platoon setpoint published at step={self.step} sim_t={self.sim_time:.3f}s sp={float(sp):.3f}"
             )
+
         self.platoon_sp_pub.publish(Float32(data=float(sp)))
         if self._mcu_setpoint_pub is not None:
             self._mcu_setpoint_pub.publish(Float32(data=float(sp)))
@@ -710,28 +850,21 @@ class FollowingRosTest(Node):
             else:
                 ttcs.append(float("inf"))
 
-        # Step logic to change lead SP when ego settles (matches Python script).
-        # Only start sequencing once the test is enabled (or if no MCU is used).
-        if (self._test_started or self.mcu_index is None) and self.plen > 1 and (self.step - self.last_change_step) >= self.min_wait_steps:
-            ego_speed = float(speeds[self.ego_index])
-            if abs(ego_speed - self.last_change_speed) <= self.band:
-                if self.lead_sp_idx == (len(self.lead_speed_setpoints) - 1):
-                    self.finished = True
-                else:
-                    self.lead_sp_idx = (self.lead_sp_idx + 1) % len(self.lead_speed_setpoints)
-                self.get_logger().info(
-                    f"Lead SP change to {self.lead_speed_setpoints[self.lead_sp_idx]:.3f} m/s "
-                    f"at t={self.sim_time:.2f}s (ego speed: {ego_speed:.2f} m/s)"
-                )
-                self.last_change_step = self.step
-                self.last_change_speed = ego_speed
-            else:
-                self.last_change_step = self.step
-                self.last_change_speed = ego_speed
+        # Note: plan advancement is handled above via leader stability gating.
 
         # Logging to CSV: per-vehicle throttle, brake, speed, accel_x,
         # local setpoint, distance to previous, desired distance, dist_err, vel_diff, ttc
-        row = [f"{self.sim_time:.4f}", str(int(self._teleport_event))]
+        row = [
+            f"{self.sim_time:.4f}",
+            str(int(self._teleport_event)),
+            f"{float(sp):.4f}",
+            str(int(plan_idx)),
+            str(plan_name),
+            f"{float(leader_speed):.4f}",
+            str(int(self._leader_in_band)),
+            f"{float(self._leader_stable_s):.4f}",
+            str(int(self._emergency_active_applied)),
+        ]
         for i, name in enumerate(self.ros_names):
             cmd = self._last_cmd.get(name, {"throttle": 0.0, "brake": 0.0})
             throttle = float(cmd["throttle"])
@@ -770,13 +903,32 @@ class FollowingRosTest(Node):
         the commands computed on the previous tick are used for the next
         simulation step.
         """
+        # Capture the emergency flag for the controls we are about to apply.
+        self._emergency_active_applied = bool(getattr(self, "_emergency_active", False))
+
         for name, v in zip(self.ros_names, self.vehicles):
             cmd = self._last_cmd.get(name, {"throttle": 0.0, "brake": 0.0})
             throttle_cmd = max(0.0, min(1.0, float(cmd["throttle"])))
             brake_cmd = max(0.0, min(1.0, float(cmd["brake"])))
 
+            # Deterministic emergency brake hijack on the leader (used by the
+            # standardized test plan). This overrides the controller output.
+            if name == self._leader_name and bool(self._emergency_active_applied):
+                throttle_cmd = 0.0
+                brake_cmd = max(float(brake_cmd), float(EMERGENCY_BRAKE_CMD))
+                try:
+                    self._last_cmd[name]["throttle"] = float(throttle_cmd)
+                    self._last_cmd[name]["brake"] = float(brake_cmd)
+                except Exception:
+                    pass
+
             # Optional: inject mild random brake pulses on the leader.
-            if self._leader_brake_enabled and name == self._leader_name and self._leader_rng is not None:
+            if (
+                self._leader_brake_enabled
+                and name == self._leader_name
+                and self._leader_rng is not None
+                and (not bool(self._emergency_active_applied))
+            ):
                 sim_t = float(self.sim_time)
                 leader_speed = None
                 try:
