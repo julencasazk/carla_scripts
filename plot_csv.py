@@ -17,11 +17,21 @@ GRID_ALPHA = 0.35
 GRID_STYLE = "--"
 DPI = 400
 
-FONT_SIZE = 16
-TITLE_FONT_SIZE = 20
-AXIS_LABEL_FONT_SIZE = 16
-TICK_LABEL_FONT_SIZE = 14
-LEGEND_FONT_SIZE = 14
+FONT_SIZE = 24
+TITLE_FONT_SIZE = 30
+AXIS_LABEL_FONT_SIZE = 24
+TICK_LABEL_FONT_SIZE = 20
+LEGEND_FONT_SIZE = 20
+
+# Layout tuning (edit here)
+# Goal: plots fill the window with minimal margins.
+MARGIN_LEFT = 0.06
+MARGIN_RIGHT = 0.99
+MARGIN_BOTTOM = 0.07
+MARGIN_TOP_NO_TITLE = 0.98
+MARGIN_TOP_WITH_TITLE = 0.94
+HSPACE = 0.18
+TITLE_Y = 0.985
 
 # High-contrast color cycle (avoid muted defaults)
 COLOR_CYCLE = [
@@ -401,9 +411,25 @@ def main():
         axes[-1].set_xlabel(rename_map.get(args.ref, args.ref))
 
     if args.title:
-        fig.suptitle(args.title, y=0.99)
+        fig.suptitle(args.title, y=float(TITLE_Y))
 
-    fig.tight_layout()
+    # Make plots use as much of the figure canvas as possible.
+    # Use tight_layout but reserve a small band for the title if present.
+    top_rect = float(MARGIN_TOP_WITH_TITLE) if args.title else float(MARGIN_TOP_NO_TITLE)
+    try:
+        fig.tight_layout(rect=(float(MARGIN_LEFT), float(MARGIN_BOTTOM), float(MARGIN_RIGHT), float(top_rect)))
+    except Exception:
+        pass
+    try:
+        fig.subplots_adjust(
+            left=float(MARGIN_LEFT),
+            right=float(MARGIN_RIGHT),
+            bottom=float(MARGIN_BOTTOM),
+            top=float(top_rect),
+            hspace=float(HSPACE),
+        )
+    except Exception:
+        pass
 
     if args.out:
         try:
