@@ -6,6 +6,47 @@ import csv
 import sys
 from pathlib import Path
 
+# -----------------------
+# Plot style (edit here)
+# -----------------------
+# Hardcoded style values so you can tweak thesis figures without adding CLI args.
+FIG_WIDTH_IN = 10.0
+FIG_HEIGHT_PER_PLOT_IN = 3.0
+LINE_WIDTH = 2.0
+GRID_ALPHA = 0.35
+GRID_STYLE = "--"
+DPI = 400
+
+FONT_SIZE = 16
+TITLE_FONT_SIZE = 20
+AXIS_LABEL_FONT_SIZE = 16
+TICK_LABEL_FONT_SIZE = 14
+LEGEND_FONT_SIZE = 14
+
+# High-contrast color cycle (avoid muted defaults)
+COLOR_CYCLE = [
+    "#ff0000",  # red
+    "#0000ff",  # blue
+    "#00cc00",  # green
+    "#ff00ff",  # magenta
+    "#00ffff",  # cyan
+    "#ffa500",  # orange
+    "#000000",  # black
+    "#ffff00",  # yellow
+    "#8a2be2",  # blueviolet
+    "#00ff7f",  # springgreen
+]
+
+MATPLOTLIB_RCPARAMS = {
+    "font.size": FONT_SIZE,
+    "axes.titlesize": TITLE_FONT_SIZE,
+    "axes.labelsize": AXIS_LABEL_FONT_SIZE,
+    "xtick.labelsize": TICK_LABEL_FONT_SIZE,
+    "ytick.labelsize": TICK_LABEL_FONT_SIZE,
+    "legend.fontsize": LEGEND_FONT_SIZE,
+    "lines.linewidth": LINE_WIDTH,
+}
+
 try:
     import pandas as pd  # type: ignore
 except Exception:
@@ -111,6 +152,59 @@ def parse_args():
         default=None,
         help="Optional overall figure title",
     )
+    p.add_argument(
+        "--rename",
+        metavar="OLD=NEW",
+        nargs="*",
+        default=None,
+        help=(
+            "Temporarily rename columns for plot labeling (legend/ylabel only).\n"
+            "Does not change which column is read from the CSV.\n"
+            "Examples:\n"
+            "  --rename speed_carla_mps=CARLA speed_model_mps=Model\n"
+            "  --rename throttle_carla=throttle(CARLA) throttle_model=throttle(plant)\n"
+        ),
+    )
+    p.add_argument(
+        "--xlabel",
+        type=str,
+        default=None,
+        help="Override x-axis label (default: --ref column name, optionally renamed via --rename).",
+    )
+    p.add_argument(
+        "--ylabel",
+        type=str,
+        default=None,
+        help="Override y-axis label for all subplots (default: column name for singletons, or 'value' for bundled).",
+    )
+    p.add_argument(
+        "--ylabels",
+        type=str,
+        nargs="*",
+        default=None,
+        help=(
+            "Optional per-subplot y-axis labels (one per subplot, in order).\n"
+            "Overrides default ylabel behavior, but is still overridden by --ylabel."
+        ),
+    )
+    p.add_argument(
+        "--legend",
+        action="store_true",
+        default=True,
+        help="Show a legend on each subplot (default: on).",
+    )
+    p.add_argument(
+        "--no-legend",
+        dest="legend",
+        action="store_false",
+        help="Disable legends.",
+    )
+    p.add_argument(
+        "--legend-loc",
+        type=str,
+        default="best",
+        help="Legend location (matplotlib loc string, default: best).",
+    )
     return p.parse_args()
 
 
@@ -173,6 +267,33 @@ def main():
         print(f"Error: plotting requires numpy + matplotlib: {e}", file=sys.stderr)
         sys.exit(1)
 
+    # Apply hardcoded styling
+    try:
+        plt.rcParams.update(MATPLOTLIB_RCPARAMS)
+    except Exception:
+        pass
+
+    # Parse rename mappings (for labels only)
+    rename_map: dict[str, str] = {}
+    if args.rename:
+        for token in args.rename:
+            s = str(token).strip()
+            if not s:
+                continue
+            if "=" in s:
+                old, new = s.split("=", 1)
+            elif ":" in s:
+                old, new = s.split(":", 1)
+            else:
+                print(f"Error: --rename expects OLD=NEW (or OLD:NEW), got: {s!r}", file=sys.stderr)
+                sys.exit(1)
+            old = old.strip()
+            new = new.strip()
+            if not old or not new:
+                print(f"Error: invalid --rename mapping: {s!r}", file=sys.stderr)
+                sys.exit(1)
+            rename_map[old] = new
+
     plot_groups = _parse_plot_groups(list(args.plot))
     if not plot_groups:
         print("Error: no valid plot columns parsed from -p/--plot.", file=sys.stderr)
@@ -229,15 +350,14 @@ def main():
         x = arrs[args.ref][mask]
         y_arrays = {c: arrs[c][mask] for c in flat_cols_unique}
 
-    # color sequence: orange, blue, red, green, purple, brown, pink, gray, olive, cyan
-    colors = ["orange", "blue", "red", "green", "purple", "brown", "pink", "gray", "olive", "cyan"]
+    colors = list(COLOR_CYCLE)
 
     n_plots = len(plot_groups)
     # one tall figure, height grows with number of plots
     fig, axes = plt.subplots(
         n_plots,
         1,
-        figsize=(10, 3 * n_plots),
+        figsize=(float(FIG_WIDTH_IN), float(FIG_HEIGHT_PER_PLOT_IN) * n_plots),
         sharex=True,
     )
 
@@ -254,18 +374,31 @@ def main():
                 pass
 
             color = colors[(gi + li) % len(colors)]
-            ax.plot(x, y_arrays[col], color=color, label=col)
+            label = rename_map.get(col, col)
+            ax.plot(x, y_arrays[col], color=color, label=label)
 
-        if len(group) == 1:
-            ax.set_ylabel(group[0])
+        # Y label precedence:
+        #   --ylabel (global) > --ylabels (per subplot) > default
+        if args.ylabel:
+            ax.set_ylabel(str(args.ylabel))
+        elif args.ylabels and gi < len(args.ylabels) and str(args.ylabels[gi]).strip():
+            ax.set_ylabel(str(args.ylabels[gi]).strip())
         else:
-            ax.set_ylabel("value")
-            ax.legend(loc="best")
+            if len(group) == 1:
+                ax.set_ylabel(rename_map.get(group[0], group[0]))
+            else:
+                ax.set_ylabel("value")
 
-        ax.grid(True, linestyle="--", alpha=0.4)
+        if args.legend:
+            ax.legend(loc=str(args.legend_loc))
+
+        ax.grid(True, linestyle=str(GRID_STYLE), alpha=float(GRID_ALPHA))
 
     # common x-label on the last subplot
-    axes[-1].set_xlabel(args.ref)
+    if args.xlabel:
+        axes[-1].set_xlabel(str(args.xlabel))
+    else:
+        axes[-1].set_xlabel(rename_map.get(args.ref, args.ref))
 
     if args.title:
         fig.suptitle(args.title, y=0.99)
@@ -274,7 +407,7 @@ def main():
 
     if args.out:
         try:
-            fig.savefig(args.out, dpi=150)
+            fig.savefig(args.out, dpi=int(DPI))
             print(f"Saved plot: {args.out}")
         except Exception as e:
             print(f"Error saving figure: {e}", file=sys.stderr)
