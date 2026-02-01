@@ -141,6 +141,39 @@ def parse_args():
         help="X-axis column name (default: time_s)",
     )
     p.add_argument(
+        "--hist",
+        action="store_true",
+        default=False,
+        help="Plot histograms of the selected columns instead of time-series vs --ref.",
+    )
+    p.add_argument(
+        "--bins",
+        type=int,
+        default=50,
+        help="Histogram bin count (default: 50). Only used with --hist.",
+    )
+    p.add_argument(
+        "--density",
+        action="store_true",
+        default=False,
+        help="Normalize histograms to probability density. Only used with --hist.",
+    )
+    p.add_argument(
+        "--dropout-base",
+        type=float,
+        default=None,
+        help=(
+            "Base value for dropout calculation (same units as the plotted column, e.g. ms). "
+            "If omitted, uses the column median as the base."
+        ),
+    )
+    p.add_argument(
+        "--dropout-mult",
+        type=float,
+        default=2.0,
+        help="Dropout threshold multiplier (default: 2.0). A sample is a dropout if value > dropout_mult * base.",
+    )
+    p.add_argument(
         "-p",
         "--plot",
         metavar="FIELD",
@@ -320,7 +353,7 @@ def main():
             seen.add(c)
             flat_cols_unique.append(c)
 
-    required_cols = [args.ref] + flat_cols_unique
+    required_cols = (flat_cols_unique if args.hist else ([args.ref] + flat_cols_unique))
     if df is not None:
         try:
             validate_columns(df, required_cols)
@@ -329,7 +362,7 @@ def main():
             sys.exit(1)
 
         df = df.dropna(subset=required_cols)
-        x = np.asarray(df[args.ref], dtype=float)
+        x = np.asarray(df[args.ref], dtype=float) if not args.hist else None
         y_arrays = {c: np.asarray(df[c], dtype=float) for c in flat_cols_unique}
     else:
         assert data_raw is not None
@@ -357,7 +390,7 @@ def main():
         mask = np.ones(n, dtype=bool)
         for c in required_cols:
             mask &= np.isfinite(arrs[c])
-        x = arrs[args.ref][mask]
+        x = arrs[args.ref][mask] if not args.hist else None
         y_arrays = {c: arrs[c][mask] for c in flat_cols_unique}
 
     colors = list(COLOR_CYCLE)
@@ -379,13 +412,48 @@ def main():
         for li, col in enumerate(group):
             try:
                 yv = y_arrays[col]
-                print(f"Column {col}, avg: {np.average(yv)}, max: {np.max(yv)}, min: {np.min(yv)}")
+                med = float(np.median(yv))
+                q25 = float(np.quantile(yv, 0.25))
+                q75 = float(np.quantile(yv, 0.75))
+                iqr = float(q75 - q25)
+                std = float(np.std(yv))
+                base = float(args.dropout_base) if args.dropout_base is not None else float(med)
+                mult = float(args.dropout_mult)
+                thr = float(mult * base)
+                # Note: y_arrays already filters to finite values, but keep this robust.
+                yv_f = yv[np.isfinite(yv)]
+                n = int(yv_f.size)
+                n_drop = int(np.sum(yv_f > thr)) if n > 0 else 0
+                drop_rate = (float(n_drop) / float(n)) if n > 0 else float("nan")
+                print(
+                    f"Column {col}, "
+                    f"avg: {float(np.average(yv))}, "
+                    f"std: {std}, "
+                    f"median: {med}, "
+                    f"iqr: {iqr}, "
+                    f"q25: {q25}, "
+                    f"q75: {q75}, "
+                    f"max: {float(np.max(yv))}, "
+                    f"min: {float(np.min(yv))}, "
+                    f"dropout_rate: {drop_rate} "
+                    f"(dropouts: {n_drop}/{n}, threshold: {thr} = {mult}*{base})"
+                )
             except Exception:
                 pass
 
             color = colors[(gi + li) % len(colors)]
             label = rename_map.get(col, col)
-            ax.plot(x, y_arrays[col], color=color, label=label)
+            if args.hist:
+                ax.hist(
+                    y_arrays[col],
+                    bins=int(max(1, args.bins)),
+                    density=bool(args.density),
+                    alpha=0.45,
+                    color=color,
+                    label=label,
+                )
+            else:
+                ax.plot(x, y_arrays[col], color=color, label=label)
 
         # Y label precedence:
         #   --ylabel (global) > --ylabels (per subplot) > default
@@ -408,7 +476,7 @@ def main():
     if args.xlabel:
         axes[-1].set_xlabel(str(args.xlabel))
     else:
-        axes[-1].set_xlabel(rename_map.get(args.ref, args.ref))
+        axes[-1].set_xlabel("value" if args.hist else rename_map.get(args.ref, args.ref))
 
     if args.title:
         fig.suptitle(args.title, y=float(TITLE_Y))

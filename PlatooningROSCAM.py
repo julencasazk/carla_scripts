@@ -17,6 +17,7 @@ must be handled in a separate bridge node.
 
 import math
 import time
+from typing import Optional
 
 import rclpy
 from rclpy.node import Node
@@ -40,6 +41,11 @@ class PlatoonMember(Node):
         min_spacing: float = 5.0,
         K_dist: float = 0.2,
         K_vel: float = 1.0,
+        K_dist_panic: Optional[float] = None,
+        K_vel_panic: Optional[float] = None,
+        ttc_panic_s: float = 2.0,
+        dist_err_deadband_m: float = 0.0,
+        vel_diff_deadband_mps: float = 0.0,
         control_period: float = 0.05,
         platoon_id: str = "plat_0",
         K_brake = 1.0,
@@ -59,8 +65,13 @@ class PlatoonMember(Node):
         self._fast_pid = fast_pid
         self._desired_time_headway = desired_time_headway
         self._min_spacing = min_spacing
-        self._K_dist = K_dist
-        self._K_vel = K_vel
+        self._K_dist_normal = float(K_dist)
+        self._K_vel_normal = float(K_vel)
+        self._K_dist_panic = float(K_dist_panic) if K_dist_panic is not None else float(K_dist)
+        self._K_vel_panic = float(K_vel_panic) if K_vel_panic is not None else float(K_vel)
+        self._ttc_panic_s = float(ttc_panic_s)
+        self._dist_err_deadband_m = float(dist_err_deadband_m)
+        self._vel_diff_deadband_mps = float(vel_diff_deadband_mps)
         self._K_brake = K_brake
 
         self._control_period = float(control_period)
@@ -98,6 +109,11 @@ class PlatoonMember(Node):
         self._brake_enable = True
         self._brake_deadband = 0.02
         self._brake_rate_limit = 1.0  # brake units per second
+        # If the predecessor is far away, fall back to a single signed speed PID
+        # (u<0 => brake) instead of the decel->brake supervisor/mapping. This helps
+        # prevent the brake supervisor from slowing vehicles that are trying to
+        # catch up from far behind.
+        self._brake_mapping_max_dist_m = 8.0
 
         # Hardcoded per-range brake calibration from CARLA test
         #
@@ -446,13 +462,24 @@ class PlatoonMember(Node):
             self._last_eff_sp = base_sp
             return base_sp
 
-        desired_dist, dist_err, vel_diff, _, _ = self._compute_spacing_signals()
-        
+        desired_dist, dist_err, vel_diff, _, ttc = self._compute_spacing_signals()
 
-        if dist_err >= 0.0:
-            d_sp = self._K_dist * dist_err + self._K_vel * vel_diff
+        # Panic gain switching: when TTC to the predecessor is low (closing),
+        # use higher gains to react more aggressively.
+        in_panic = bool(float(ttc) <= float(self._ttc_panic_s))
+        K_dist = float(self._K_dist_panic if in_panic else self._K_dist_normal)
+        K_vel = float(self._K_vel_panic if in_panic else self._K_vel_normal)
+
+        # Deadbands to avoid chasing noise.
+        if abs(float(dist_err)) < float(self._dist_err_deadband_m):
+            dist_err = 0.0
+        if abs(float(vel_diff)) < float(self._vel_diff_deadband_mps):
+            vel_diff = 0.0
+
+        if float(dist_err) >= 0.0:
+            d_sp = (K_dist * float(dist_err)) + (K_vel * float(vel_diff))
         else:
-            d_sp = 4.0 * (self._K_dist * dist_err + self._K_vel * vel_diff)
+            d_sp = 4.0 * ((K_dist * float(dist_err)) + (K_vel * float(vel_diff)))
 
         eff_sp = min(base_sp + d_sp, 33.33)
         eff_sp = max(eff_sp, 0.0)
@@ -555,13 +582,27 @@ class PlatoonMember(Node):
         if self._update_speed_range(speed_meas):
             self._reset_selected_pid()
 
-        # Throttle-only speed PID (no direct braking from negative u)
         u = float(self._select_pid().step(float(speed_sp), speed_meas))
-        throttle_cmd = max(0.0, min(1.0, u))
+        u = float(max(-1.0, min(1.0, u)))
 
-        brake_cmd = float(self.compute_brake(speed_sp=speed_sp, throttle_req=throttle_cmd))
-        if brake_cmd > 0.0:
-            throttle_cmd = 0.0
+        # Far-range fallback: single signed PID (direct brake/throttle).
+        mapping_hold = bool(self._brake_active) or (float(self._brake_cmd_prev) > float(self._brake_deadband))
+        if (
+            self._platoon_index > 0
+            and float(self._dist_to_veh) > float(self._brake_mapping_max_dist_m)
+            and (not mapping_hold)
+        ):
+            throttle_cmd = max(0.0, min(1.0, u))
+            brake_cmd = max(0.0, min(1.0, -u))
+            # Disable decel-intent sharing in this mode; we're not using the
+            # decel supervisor/mapping.
+            self._desired_decel = 0.0
+        else:
+            # Near-range: throttle-only speed PID + brake supervisor/mapping.
+            throttle_cmd = max(0.0, min(1.0, u))
+            brake_cmd = float(self.compute_brake(speed_sp=speed_sp, throttle_req=throttle_cmd))
+            if brake_cmd > 0.0:
+                throttle_cmd = 0.0
 
 
         # Lightweight periodic debug (helps diagnose "stuck at 0 throttle").

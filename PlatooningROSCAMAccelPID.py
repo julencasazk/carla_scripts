@@ -29,6 +29,7 @@ Placeholder gains are used by default; tune them externally.
 
 import math
 import time
+from typing import Optional
 
 import rclpy
 from rclpy.node import Node
@@ -55,6 +56,11 @@ class PlatoonMember(Node):
         min_spacing: float = 5.0,
         K_dist: float = 0.2,
         K_vel: float = 1.0,
+        K_dist_panic: Optional[float] = None,
+        K_vel_panic: Optional[float] = None,
+        ttc_panic_s: float = 2.0,
+        dist_err_deadband_m: float = 0.0,
+        vel_diff_deadband_mps: float = 0.0,
         control_period: float = 0.05,
         platoon_id: str = "plat_0",
     ):
@@ -71,8 +77,13 @@ class PlatoonMember(Node):
 
         self._desired_time_headway = float(desired_time_headway)
         self._min_spacing = float(min_spacing)
-        self._K_dist = float(K_dist)
-        self._K_vel = float(K_vel)
+        self._K_dist_normal = float(K_dist)
+        self._K_vel_normal = float(K_vel)
+        self._K_dist_panic = float(K_dist_panic) if K_dist_panic is not None else float(K_dist)
+        self._K_vel_panic = float(K_vel_panic) if K_vel_panic is not None else float(K_vel)
+        self._ttc_panic_s = float(ttc_panic_s)
+        self._dist_err_deadband_m = float(dist_err_deadband_m)
+        self._vel_diff_deadband_mps = float(vel_diff_deadband_mps)
         self._control_period = float(control_period)
         self._platoon_id = str(platoon_id)
 
@@ -300,11 +311,20 @@ class PlatoonMember(Node):
             self._last_vel_diff = 0.0
             return float(base_sp)
 
-        desired_dist, dist_err, vel_diff, _, _ = self._compute_spacing_signals()
+        desired_dist, dist_err, vel_diff, _, ttc = self._compute_spacing_signals()
         self._last_dist_err = float(dist_err)
         self._last_vel_diff = float(vel_diff)
 
-        d_sp = float(self._K_dist) * float(dist_err) + float(self._K_vel) * float(vel_diff)
+        in_panic = bool(float(ttc) <= float(self._ttc_panic_s))
+        K_dist = float(self._K_dist_panic if in_panic else self._K_dist_normal)
+        K_vel = float(self._K_vel_panic if in_panic else self._K_vel_normal)
+
+        if abs(float(dist_err)) < float(self._dist_err_deadband_m):
+            dist_err = 0.0
+        if abs(float(vel_diff)) < float(self._vel_diff_deadband_mps):
+            vel_diff = 0.0
+
+        d_sp = (K_dist * float(dist_err)) + (K_vel * float(vel_diff))
         eff_sp = float(base_sp + d_sp)
         self._last_eff_sp = float(eff_sp)
         return float(max(0.0, eff_sp))
