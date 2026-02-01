@@ -690,6 +690,40 @@ def main():
     # Limits
     parser.add_argument("--a-min", type=float, default=-6.0, help="Outer PID output min (m/s^2).")
     parser.add_argument("--a-max", type=float, default=3.0, help="Outer PID output max (m/s^2).")
+
+    # ACC tuning knobs (local setpoint shaping)
+    parser.add_argument("--k-dist", type=float, default=2.0, help="Distance-error gain for local setpoint (normal).")
+    parser.add_argument("--k-vel", type=float, default=1.0, help="Relative-speed gain for local setpoint (normal).")
+    parser.add_argument(
+        "--k-dist-panic",
+        type=float,
+        default=None,
+        help="Distance-error gain in panic mode (defaults to --k-dist).",
+    )
+    parser.add_argument(
+        "--k-vel-panic",
+        type=float,
+        default=None,
+        help="Relative-speed gain in panic mode (defaults to --k-vel).",
+    )
+    parser.add_argument(
+        "--ttc-panic-s",
+        type=float,
+        default=2.0,
+        help="Enter panic mode when TTC to predecessor is <= this threshold (seconds).",
+    )
+    parser.add_argument(
+        "--dist-err-deadband-m",
+        type=float,
+        default=0.0,
+        help="Deadband on distance error (meters) before it affects local setpoint.",
+    )
+    parser.add_argument(
+        "--vel-diff-deadband-mps",
+        type=float,
+        default=0.0,
+        help="Deadband on relative speed (m/s) before it affects local setpoint.",
+    )
     args = parser.parse_args()
 
     rclpy.init()
@@ -788,8 +822,13 @@ def main():
             accel_pid_high=accel_pid_high,
             desired_time_headway=float(bridge._desired_time_headways.get(name, 0.3)),
             min_spacing=float(bridge._min_spacings.get(name, 5.0)),
-            K_dist=2.0,
-            K_vel=1.0,
+            K_dist=float(args.k_dist),
+            K_vel=float(args.k_vel),
+            K_dist_panic=(None if args.k_dist_panic is None else float(args.k_dist_panic)),
+            K_vel_panic=(None if args.k_vel_panic is None else float(args.k_vel_panic)),
+            ttc_panic_s=float(args.ttc_panic_s),
+            dist_err_deadband_m=float(args.dist_err_deadband_m),
+            vel_diff_deadband_mps=float(args.vel_diff_deadband_mps),
             control_period=Ts,
         )
 

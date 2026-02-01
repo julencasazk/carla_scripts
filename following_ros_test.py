@@ -5,6 +5,7 @@ import time
 import csv
 import threading
 import queue
+from typing import Optional
 
 import carla
 import cv2
@@ -144,9 +145,12 @@ class PlatoonMemberDirectPID(Node):
         fast_gains: tuple[float, float, float, float],
         desired_time_headway: float,
         min_spacing: float,
-        K_dist: float,
-        K_vel: float,
+        K_dist_normal: float,
+        K_vel_normal: float,
         control_period: float,
+        K_dist_panic: Optional[float] = None,
+        K_vel_panic: Optional[float] = None,
+        ttc_panic_s: float = 2.0,
         platoon_id: str = "plat_0",
     ) -> None:
         super().__init__(name)
@@ -157,8 +161,11 @@ class PlatoonMemberDirectPID(Node):
 
         self._desired_time_headway = float(desired_time_headway)
         self._min_spacing = float(min_spacing)
-        self._K_dist = float(K_dist)
-        self._K_vel = float(K_vel)
+        self._K_dist_normal = float(K_dist_normal)
+        self._K_vel_normal = float(K_vel_normal)
+        self._K_dist_panic = float(K_dist_panic) if K_dist_panic is not None else float(K_dist_normal)
+        self._K_vel_panic = float(K_vel_panic) if K_vel_panic is not None else float(K_vel_normal)
+        self._ttc_panic_s = float(ttc_panic_s)
         self._control_period = float(control_period)
 
         # Latest state
@@ -330,6 +337,7 @@ class PlatoonMemberDirectPID(Node):
         ts_ms = int(self._state_stamp.sec * 1000 + self._state_stamp.nanosec // 1_000_000)
         return int(ts_ms % 4294967296)
 
+    # Static methods for compatibility with how CAM messages are created. 
     @staticmethod
     def _pack_speed_mps(speed_mps: float) -> int:
         return int(max(0, min(65535, round(float(speed_mps) * 100.0))))
@@ -377,14 +385,33 @@ class PlatoonMemberDirectPID(Node):
         v_lead = float(self._preceding_speed) if self._preceding_speed is not None else v
         vel_diff = float(v_lead) - float(v)
 
-        if dist_err >= 0.0:
-            d_sp = float(self._K_dist) * dist_err + float(self._K_vel) * vel_diff
-        else:
-            d_sp = 4.0 * (float(self._K_dist) * dist_err + float(self._K_vel) * vel_diff)
+        # Panic gating: if TTC to preceding vehicle is low (closing), switch to
+        # higher gains to brake harder. This only changes gains; the structure
+        # of the setpoint calculation is unchanged.
+        ttc_s = float("inf")
+        closing_speed = max(float(v) - float(v_lead), 0.0)
+        if float(self._dist_to_veh) > 0.0 and closing_speed > 0.1:
+            ttc_s = float(self._dist_to_veh) / float(closing_speed)
+
+        in_panic = bool(ttc_s <= float(self._ttc_panic_s))
+        K_dist = float(self._K_dist_panic if in_panic else self._K_dist_normal)
+        K_vel = float(self._K_vel_panic if in_panic else self._K_vel_normal)
+
+        d_sp = 0.0
+
+        if abs(dist_err) > 0.02:
+            d_sp = d_sp + (K_dist * dist_err)
+        
+        if abs(vel_diff) > 5:
+            d_sp = d_sp + (K_vel * vel_diff)
+        
+        if d_sp < 0.0:
+            d_sp = 4 * d_sp
 
         eff_sp = float(base_sp) + float(d_sp)
         eff_sp = min(eff_sp, 33.33)
         eff_sp = max(eff_sp, 0.0)
+
         return float(eff_sp)
 
     def _apply_mode_hysteresis(self, u: float) -> tuple[float, float, str]:
@@ -554,6 +581,14 @@ class FollowingRosTest(Node):
         self._last_throttle_rx_wall_s = {}
         self._last_brake_rx_wall_s = {}
         self._last_applied_cmd_rx_wall_s = {}
+        # Derived timing signals for plotting (per vehicle):
+        # - inter-arrival times: dt between successive received messages
+        # - applied age: how stale the last received cmd pair was when applied
+        self._last_throttle_rx_dt_ms = {}
+        self._last_brake_rx_dt_ms = {}
+        self._last_cmd_pair_rx_wall_s = {}
+        self._last_cmd_pair_rx_dt_ms = {}
+        self._last_cmd_age_ms = {}
 
         # Latest local speed setpoints from PlatoonMember nodes (name -> float)
         self._last_local_sp = {}
@@ -664,6 +699,11 @@ class FollowingRosTest(Node):
             self._last_throttle_rx_wall_s[ros_name] = None
             self._last_brake_rx_wall_s[ros_name] = None
             self._last_applied_cmd_rx_wall_s[ros_name] = None
+            self._last_throttle_rx_dt_ms[ros_name] = None
+            self._last_brake_rx_dt_ms[ros_name] = None
+            self._last_cmd_pair_rx_wall_s[ros_name] = None
+            self._last_cmd_pair_rx_dt_ms[ros_name] = None
+            self._last_cmd_age_ms[ros_name] = None
             self._last_local_sp[ros_name] = 0.0
 
             # Command subscribers (absolute topics)
@@ -747,6 +787,10 @@ class FollowingRosTest(Node):
             header.extend([
                 f"throttle_{suffix}",
                 f"brake_{suffix}",
+                f"cmd_age_ms_{suffix}",
+                f"throttle_rx_dt_ms_{suffix}",
+                f"brake_rx_dt_ms_{suffix}",
+                f"cmd_pair_rx_dt_ms_{suffix}",
                 f"speed_{suffix}",
                 f"accel_x_{suffix}",
                 f"local_sp_{suffix}",
@@ -873,8 +917,11 @@ class FollowingRosTest(Node):
         if name in self._last_cmd:
             self._last_cmd[name]["throttle"] = value
             now_s = time.perf_counter()
+            prev_s = self._last_throttle_rx_wall_s.get(name)
             self._last_throttle_rx_wall_s[name] = now_s
             self._last_cmd_rx_wall_s[name] = now_s
+            if prev_s is not None:
+                self._last_throttle_rx_dt_ms[name] = (float(now_s) - float(prev_s)) * 1000.0
 
             if self.mcu_ros_name is not None and name == self.mcu_ros_name and self._first_ego_throttle_step is None:
                 self._first_ego_throttle_step = self.step
@@ -889,18 +936,24 @@ class FollowingRosTest(Node):
                     f"Test sequence enabled after first MCU throttle message ({name}) (step={self.step})."
                 )
 
+            self._update_cmd_pair_timing(name)
+
     def _brake_cb(self, msg: Float32, name: str) -> None:
         value = float(msg.data)
         if name in self._last_cmd:
             self._last_cmd[name]["brake"] = value
             now_s = time.perf_counter()
+            prev_s = self._last_brake_rx_wall_s.get(name)
             self._last_brake_rx_wall_s[name] = now_s
             self._last_cmd_rx_wall_s[name] = now_s
+            if prev_s is not None:
+                self._last_brake_rx_dt_ms[name] = (float(now_s) - float(prev_s)) * 1000.0
             if self.mcu_ros_name is not None and name == self.mcu_ros_name and self._first_ego_brake_step is None:
                 self._first_ego_brake_step = self.step
                 self.get_logger().info(
                     f"First MCU brake received ({name}) at step={self.step} sim_t={self.sim_time:.3f}s value={value:.6f}"
                 )
+            self._update_cmd_pair_timing(name)
 
     def _latest_cmd_pair_rx_wall_s(self, name: str):
         """Return wall-time when a full (throttle+brake) pair was last received."""
@@ -909,6 +962,19 @@ class FollowingRosTest(Node):
         if t_th is None or t_br is None:
             return None
         return max(float(t_th), float(t_br))
+
+    def _update_cmd_pair_timing(self, name: str) -> None:
+        """Track inter-arrival time of complete throttle+brake pairs."""
+        pair_rx = self._latest_cmd_pair_rx_wall_s(name)
+        if pair_rx is None:
+            return
+        prev_pair = self._last_cmd_pair_rx_wall_s.get(name)
+        # Only update if the pair timestamp advances (can remain unchanged if the
+        # "other" message is newer than the current one).
+        if prev_pair is None or float(pair_rx) > float(prev_pair):
+            if prev_pair is not None:
+                self._last_cmd_pair_rx_dt_ms[name] = (float(pair_rx) - float(prev_pair)) * 1000.0
+            self._last_cmd_pair_rx_wall_s[name] = float(pair_rx)
 
     def _local_sp_cb(self, msg: Float32, name: str) -> None:
         value = float(msg.data)
@@ -1233,6 +1299,10 @@ class FollowingRosTest(Node):
             cmd = self._last_cmd.get(name, {"throttle": 0.0, "brake": 0.0})
             throttle = float(cmd["throttle"])
             brake = float(cmd["brake"])
+            cmd_age_ms = self._last_cmd_age_ms.get(name)
+            th_dt_ms = self._last_throttle_rx_dt_ms.get(name)
+            br_dt_ms = self._last_brake_rx_dt_ms.get(name)
+            pair_dt_ms = self._last_cmd_pair_rx_dt_ms.get(name)
             speed_i = float(speeds[i])
             accel_x_i = float(accels[i].x)
             local_sp = float(self._last_local_sp.get(name, sp))
@@ -1245,6 +1315,10 @@ class FollowingRosTest(Node):
             row.extend([
                 f"{throttle:.4f}",
                 f"{brake:.4f}",
+                ("" if cmd_age_ms is None else f"{float(cmd_age_ms):.4f}"),
+                ("" if th_dt_ms is None else f"{float(th_dt_ms):.4f}"),
+                ("" if br_dt_ms is None else f"{float(br_dt_ms):.4f}"),
+                ("" if pair_dt_ms is None else f"{float(pair_dt_ms):.4f}"),
                 f"{speed_i:.4f}",
                 f"{accel_x_i:.4f}",
                 f"{local_sp:.4f}",
@@ -1364,6 +1438,9 @@ class FollowingRosTest(Node):
             cmd_pair_rx_s = self._latest_cmd_pair_rx_wall_s(name)
             if cmd_pair_rx_s is not None:
                 self._last_applied_cmd_rx_wall_s[name] = cmd_pair_rx_s
+                self._last_cmd_age_ms[name] = (time.perf_counter() - float(cmd_pair_rx_s)) * 1000.0
+            else:
+                self._last_cmd_age_ms[name] = None
             if (
                 self.mcu_ros_name is not None
                 and name == self.mcu_ros_name
@@ -1375,7 +1452,16 @@ class FollowingRosTest(Node):
                         self.get_logger().info("MCU cmd age: N/A (no throttle+brake received yet)")
                     else:
                         age_ms = (time.perf_counter() - float(cmd_pair_rx_s)) * 1000.0
-                        self.get_logger().info(f"MCU cmd age at apply: {age_ms:.2f} ms")
+                        th_dt = self._last_throttle_rx_dt_ms.get(name)
+                        br_dt = self._last_brake_rx_dt_ms.get(name)
+                        pair_dt = self._last_cmd_pair_rx_dt_ms.get(name)
+                        self.get_logger().info(
+                            "MCU cmd age at apply: "
+                            f"{age_ms:.2f} ms "
+                            f"(th_dt={('N/A' if th_dt is None else f'{float(th_dt):.2f}')} ms, "
+                            f"br_dt={('N/A' if br_dt is None else f'{float(br_dt):.2f}')} ms, "
+                            f"pair_dt={('N/A' if pair_dt is None else f'{float(pair_dt):.2f}')} ms)"
+                        )
 
             if (
                 self.mcu_ros_name is not None
@@ -1575,8 +1661,11 @@ def main():
             fast_gains=(fast_pid.kp, fast_pid.ki, fast_pid.kd, fast_pid.n),
             desired_time_headway=desired_time_headway,
             min_spacing=min_spacing,
-            K_dist=1.0,
-            K_vel=0.0,
+            K_dist_normal=0.8,
+            K_vel_normal=0.0,
+            K_dist_panic=0.8,
+            K_vel_panic=0.0,
+            ttc_panic_s=2.0,
             control_period=Ts,
         )
 
