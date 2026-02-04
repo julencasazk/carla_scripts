@@ -1,5 +1,7 @@
 #!/usr/bin/bash
 # =======================================
+# DEPRECATED!!! Use VENV insread of conda
+#                  as specified in README.md
 # Script: setup_env.sh
 # Author: julencasazk
 # Description:
