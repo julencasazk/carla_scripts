@@ -772,7 +772,8 @@ class PlatoonMember(Node):
                 self._pack_accel_mps2(cam_decel)
             )
             cam_msg.cam.cam_parameters.high_frequency_container.platoon_position = int(self._platoon_index)
-            cam_msg.cam.cam_parameters.high_frequency_container.platoon_id = int(self._platoon_id)
+            # Unused for now    
+            #cam_msg.cam.cam_parameters.high_frequency_container.platoon_id = int(self._platoon_id)
             self._cam_pub.publish(cam_msg)
 
         '''
